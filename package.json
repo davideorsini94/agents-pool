@@ -1,0 +1,35 @@
+{
+  "name": "agents-windows",
+  "productName": "Agents Windows",
+  "version": "0.1.0",
+  "description": "Multi-console desktop window for a team of AI agents powered by OpenCode Go",
+  "main": "dist/main/main.js",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc -p tsconfig.main.json && tsc -p tsconfig.renderer.json",
+    "start": "npm run build && electron .",
+    "dev": "npm run build && electron . --dev",
+    "dist": "npm run build && electron-builder",
+    "dist:mac": "npm run build && electron-builder --mac",
+    "dist:win": "npm run build && electron-builder --win",
+    "dist:linux": "npm run build && electron-builder --linux"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "electron": "^44.1.1",
+    "electron-builder": "^26.15.3",
+    "typescript": "^5.9.3"
+  },
+  "build": {
+    "appId": "dev.agentswindows.app",
+    "productName": "Agents Windows",
+    "directories": { "output": "release", "buildResources": "build" },
+    "files": ["dist/**/*", "src/renderer/index.html", "src/renderer/styles.css", "package.json"],
+    "asar": true,
+    "mac": { "category": "public.app-category.developer-tools", "target": [{ "target": "dmg", "arch": ["arm64", "x64"] }], "icon": "build/icon.png", "identity": null },
+    "win": { "target": [{ "target": "nsis", "arch": ["x64"] }], "icon": "build/icon.png" },
+    "nsis": { "oneClick": false, "allowToChangeInstallationDirectory": true },
+    "linux": { "target": ["AppImage", "deb"], "category": "Development", "icon": "build/icon.png", "maintainer": "agents-windows" }
+  }
+}
