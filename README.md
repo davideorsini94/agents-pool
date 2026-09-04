@@ -5,8 +5,15 @@ App desktop per **Linux, macOS e Windows** (Electron + TypeScript, nessuna dipen
 
 - Una console colorata per ogni agente: nome, ruolo, modello, stato, e **tutto** quello che fa e pensa
   (ragionamento in streaming, testo, chiamate agli strumenti con argomenti e risultati, deleghe, permessi, errori, token/costo).
-- Si parla con un solo agente **principale**; gli altri collaborano secondo un **protocollo di interazione** scritto a parole.
-  Il controllo torna sempre al principale, che produce la risposta finale.
+- Si parla con un solo agente **orchestratore**; gli altri collaborano secondo un **protocollo di interazione** scritto a parole.
+  Il controllo torna sempre a lui, che produce la risposta finale.
+- Architettura a **ruoli con istanze dinamiche**: orchestratore, planner, worker e verificatore sono *template* configurabili
+  (quanti vuoi, di qualunque ruolo, aggiungibili e rimovibili quando vuoi). I worker vengono istanziati per singolo task, con
+  contesto pulito e una console effimera propria, e comunicano solo con l'orchestratore (hub-and-spoke, mai fra loro).
+- Le richieste conversazionali costano **zero agenti**: l'orchestratore risponde da solo (livello T0) e delega solo quando serve
+  (T1 un worker, T2 più worker in parallelo, T3 pianificazione prima di eseguire).
+- Limiti applicati dal codice e modificabili nelle impostazioni: worker paralleli (4), istanze per richiesta (8), round di
+  correzione (1), budget per task in token/chiamate/secondi con arresto automatico.
 - Strumenti: lettura/scrittura/modifica file nel workspace, ricerca, esecuzione comandi, informazioni di sistema e di rete, domande all'utente.
 - Le azioni sensibili chiedono **autorizzazione direttamente all'utente** (modale), senza passare dall'agente principale.
 - Tutte le impostazioni (prompt, protocollo, modelli, agenti, workspace, modalità permessi, chiave) si modificano a caldo:
@@ -39,11 +46,22 @@ npm start
 
 ## Permessi
 
-Tre modalità (Impostazioni → Permessi): **strict**, **balanced** (default), **relaxed**.
-Le letture nel workspace e le informazioni di sistema/rete sono sempre consentite; le scritture nel workspace sono automatiche in balanced/relaxed;
-i comandi shell vengono classificati (benigno / sensibile / privilegiato / distruttivo — es. `sudo`, `netsh`, `ip`, `networksetup`, `rm -rf`, `reg add`)
-e mostrati all'utente con *Consenti*, *Consenti per la sessione* (solo comandi benigni) o *Nega*. Le richieste hanno un timeout e vengono
-registrate nella console dell'agente che le ha fatte.
+Le letture nel workspace e le informazioni di sistema/rete sono sempre consentite. I comandi shell vengono classificati
+(benigno / sensibile / privilegiato / distruttivo — es. `sudo`, `netsh`, `ip`, `networksetup`, `rm -rf`, `reg add`) e, quando serve
+il tuo consenso, la richiesta arriva **direttamente a te** in un modale con *Consenti*, *Consenti per la sessione* (solo comandi
+benigni) o *Nega*, senza passare dall'orchestratore. Le richieste hanno un timeout e restano registrate nella console dell'agente
+che le ha fatte. Quattro modalità in Impostazioni → Autorizzazioni:
+
+| Modalità | Comportamento |
+|---|---|
+| **Rigorosa** | conferma per ogni scrittura, eliminazione e comando |
+| **Bilanciata** (default) | scritture ed eliminazioni dentro il workspace automatiche; comandi e uscite dal workspace chiedono conferma |
+| **Permissiva** | comandi innocui e letture fuori dal workspace automatici; restano protetti i percorsi di sistema e le azioni distruttive |
+| **Bypass** | **non chiede mai nulla**: ogni scrittura, eliminazione e comando parte subito, anche fuori dal workspace, sui percorsi di sistema e distruttivo |
+
+Il bypass non riduce la tracciabilità: ogni azione concessa senza chiedere genera comunque un evento nella console dell'agente e una
+riga in `logs/main.log`, e finché è attivo l'intestazione mostra un badge rosso *BYPASS PERMESSI* (cliccabile per cambiare modalità).
+Usalo solo su una macchina e una cartella che puoi permetterti di perdere.
 
 ## Build dei pacchetti
 

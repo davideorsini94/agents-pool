@@ -1,22 +1,32 @@
-// AgentRuntime: FIFO task queue + the streaming run loop. PLAN §5.
+// AgentRuntime: FIFO task queue + the streaming run loop. PLAN §5, PLAN-v2 §4 (router loop) and
+// §6.2 (instance mode: in-memory history, one task, per-instance budget, `partial`).
 
 import type {
-  AgentConfig, AgentId, AgentStatus, AgentView, ChatMessage, RunState, Task, TaskResult, ToolCall, Usage,
+  AgentConfig, AgentId, AgentRole, AgentStatus, AgentView, Budget, ChatMessage, RunState, Task,
+  TaskResult, Tier, ToolCall, Usage,
 } from '../shared/types';
 import { ApiError, OpenCodeClient, StreamHandlers, ToolDef } from './api';
-import { ConfigStore } from './config';
-import { PermissionGate } from './permissions';
-import { PromptEnv, buildSystemPrompt } from './prompt';
+import type { ConfigStore } from './config';
+import { roleOf } from './contracts';
+import type { PermissionGate } from './permissions';
+import { PromptEnv, buildRolePrompt } from './prompt';
+import { ModelRouter, isSwitchable, reasonIt } from './router';
 import { ConsoleBus, StateStore } from './state';
-import { OrchestratorApi, execute, toolDefs, toolNames } from './tools';
+import { OrchestratorApi, execute, toolDefsFor, toolNamesFor } from './tools';
 import {
-  Send, addUsage, cloneUsage, emptyUsage, fmtErr, isRecord, log, logWarn,
+  Send, addUsage, cloneUsage, emptyUsage, firstBalancedObject, fmtErr, isRecord, log, logWarn,
   newId, sleep, tokenEstimate, truncate, truncateForModel,
 } from './util';
 
 const MAX_STREAM_ATTEMPTS = 5;
 const UI_OUTPUT_CAP = 32768;
 const MODEL_OUTPUT_CAP = 16000;
+/** delegate_tasks returns a batch of ResultContracts: it needs a bigger slice (PLAN-v2 §6.3). */
+const POOL_OUTPUT_CAP = 32768;
+const POOL_TOOLS = new Set(['delegate_tasks', 'run_planner', 'run_verifier', 'read_artifact']);
+/** Per-call ceiling derived from the remaining instance budget (PLAN-v2 §6.2). */
+const MIN_CALL_TOKENS = 512;
+const MAX_CALL_TOKENS = 8192;
 
 /** What the runtime needs from the orchestrator (implemented by Orchestrator). */
 export interface AgentHost extends OrchestratorApi {
@@ -25,7 +35,9 @@ export interface AgentHost extends OrchestratorApi {
   cancelRun(runId: string, reason: string): void;
   registerRun(run: RunState, runtime: AgentRuntime): void;
   unregisterRun(runId: string): void;
-  onRunFinished(run: RunState, finalText: string): void;
+  onRunFinished(run: RunState, finalText: string, taskEndEventId: string): void;
+  /** Live tier of a user request — drives the orchestrator's escalation model (PLAN-v2 §4). */
+  requestTier(requestId: string): Tier | null;
 }
 
 export interface AgentDeps {
@@ -36,8 +48,23 @@ export interface AgentDeps {
   gate: PermissionGate;
   send: Send;
   host: AgentHost;
+  router: ModelRouter;
   env: PromptEnv;
   appVersion: string;
+}
+
+/**
+ * Instance mode (PLAN-v2 §6.2). Present ⇒ this runtime is a throw-away instance of `templateId`:
+ * config/routing/tools come from the template, the history lives in memory only, the console id is
+ * this runtime's own id (`<templateId>#<path>` for workers, the template id itself for the
+ * planner/verifier, which are never concurrent), and the run is bounded by `budget`.
+ */
+export interface AgentRuntimeOpts {
+  templateId: AgentId;
+  role: AgentRole;
+  budget: Budget;
+  requestId: string;
+  escalate: boolean;
 }
 
 interface QueueItem { task: Task; runId: string; resolve: (r: TaskResult) => void }
@@ -60,21 +87,32 @@ export class AgentRuntime {
   private statusDetail: string | undefined;
   private destroyed = false;
   private lastKnownCfg: AgentConfig;
+  /** Instance history: never persisted, never in StateStore (PLAN-v2 §6.2). */
+  private readonly local: ChatMessage[] | null;
+  /** Model of the last attempt — the pool stamps it into `ResultContract.cost.model`. */
+  lastModelUsed = '';
+  private readonly templateId: AgentId;
+  readonly opts: AgentRuntimeOpts | null;
   current: RunState | null = null;
 
-  constructor(readonly id: AgentId, private readonly deps: AgentDeps) {
-    const c = deps.config.agent(id);
-    if (!c) throw new Error(`AgentRuntime: unknown agent ${id}`);
+  constructor(readonly id: AgentId, private readonly deps: AgentDeps, opts?: AgentRuntimeOpts) {
+    this.opts = opts ?? null;
+    this.templateId = opts?.templateId ?? id;
+    const c = deps.config.agent(this.templateId);
+    if (!c) throw new Error(`AgentRuntime: unknown agent ${this.templateId}`);
     this.lastKnownCfg = c;
+    this.local = opts ? [] : null;
     deps.state.ensure(id);
   }
 
   /** Live config read (never cached — hot reload, PLAN §10). */
   cfg(): AgentConfig {
-    const c = this.deps.config.agent(this.id);
+    const c = this.deps.config.agent(this.templateId);
     if (c) this.lastKnownCfg = c;
     return this.lastKnownCfg;
   }
+
+  role(): AgentRole { return this.opts ? this.opts.role : roleOf(this.cfg()); }
 
   get status(): AgentStatus { return this.statusValue; }
   get queueLength(): number { return this.queue.length; }
@@ -89,7 +127,7 @@ export class AgentRuntime {
     const runId = newId('run');
     const result = new Promise<TaskResult>((resolve) => {
       if (this.destroyed) {
-        resolve({ status: 'cancelled', text: 'agent removed by the user', runId, usage: emptyUsage() });
+        resolve({ status: 'cancelled', text: 'agent removed by the user', runId, usage: emptyUsage(), toolCalls: 0 });
         return;
       }
       this.queue.push({ task, runId, resolve });
@@ -112,7 +150,7 @@ export class AgentRuntime {
           res = await this.runTask(item);
         } catch (e) {
           logWarn(`agent ${this.id}: run crashed`, e);
-          res = { status: 'error', text: `Errore interno: ${fmtErr(e)}`, runId: item.runId, usage: emptyUsage() };
+          res = { status: 'error', text: `Errore interno: ${fmtErr(e)}`, runId: item.runId, usage: emptyUsage(), toolCalls: 0 };
         }
         item.resolve(res);
       }
@@ -129,7 +167,7 @@ export class AgentRuntime {
   cancel(reason: string): void {
     const queued = this.queue.splice(0);
     for (const q of queued) {
-      q.resolve({ status: 'cancelled', text: reason, runId: q.runId, usage: emptyUsage() });
+      q.resolve({ status: 'cancelled', text: reason, runId: q.runId, usage: emptyUsage(), toolCalls: 0 });
     }
     this.abortCurrent(reason);
     this.emitStatus();
@@ -139,7 +177,7 @@ export class AgentRuntime {
     const i = this.queue.findIndex((q) => q.runId === runId);
     if (i >= 0) {
       const [q] = this.queue.splice(i, 1);
-      q.resolve({ status: 'cancelled', text: reason, runId, usage: emptyUsage() });
+      q.resolve({ status: 'cancelled', text: reason, runId, usage: emptyUsage(), toolCalls: 0 });
       this.emitStatus();
       return;
     }
@@ -169,14 +207,36 @@ export class AgentRuntime {
   }
 
   emitStatus(): void {
+    const detail = [this.statusDetail, this.budgetDetail()].filter(Boolean).join(' · ');
     this.deps.send('agent:status', {
       agentId: this.id,
       status: this.statusValue,
       runId: this.current?.runId ?? null,
       queueLength: this.queue.length,
       usage: this.usage(),
-      ...(this.statusDetail ? { detail: this.statusDetail } : {}),
+      ...(detail ? { detail } : {}),
     });
+  }
+
+  /** `tok 3.1k/8k · tool 2/10 · 41 s/180 s` while an instance is running (PLAN-v2 §6.2). */
+  private budgetDetail(): string {
+    const run = this.current;
+    if (!this.opts || !run) return '';
+    const b = this.opts.budget;
+    const tok = run.usage.promptTokens + run.usage.completionTokens;
+    const secs = Math.round((Date.now() - run.startedAt) / 1000);
+    return `tok ${kilo(tok)}/${kilo(b.maxTokens)} · tool ${run.toolCalls ?? 0}/${b.maxToolCalls} · ${secs} s/${b.maxSeconds} s`;
+  }
+
+  // ------------------------------------------------------------ history
+
+  private history(): ChatMessage[] {
+    return this.local ?? this.deps.state.history(this.id);
+  }
+
+  private push(m: ChatMessage): void {
+    if (this.local) this.local.push(m);
+    else this.deps.state.pushHistory(this.id, m);
   }
 
   // ------------------------------------------------------------ the run loop
@@ -184,10 +244,13 @@ export class AgentRuntime {
   private async runTask(item: QueueItem): Promise<TaskResult> {
     const { task, runId } = item;
     const deps = this.deps;
-    const { bus, state, config, client } = deps;
+    const { bus, config, client, router } = deps;
     const startedAt = Date.now();
 
     const parent = task.origin.kind === 'delegation' ? deps.host.findRun(task.origin.parentRunId) : null;
+    const requestId = this.opts?.requestId
+      ?? (task.origin.kind === 'delegation' ? (task.origin.requestId ?? runId) : runId);
+    const depth = task.origin.kind === 'delegation' ? task.origin.depth : 0;
     const run: RunState = {
       runId,
       taskId: task.id,
@@ -197,44 +260,71 @@ export class AgentRuntime {
       iteration: 0,
       startedAt,
       usage: emptyUsage(),
-      ancestry: parent ? [...parent.ancestry, this.id] : [this.id],
+      // Ancestry tracks TEMPLATES, not instances, so the v1 cycle check still works (§6.3 step 0).
+      ancestry: parent ? [...parent.ancestry, this.templateId] : [this.templateId],
       childRunIds: [],
+      requestId,
+      role: this.role(),
+      toolCalls: 0,
+      ...(this.opts ? { budget: this.opts.budget } : {}),
     };
     this.current = run;
     this.abort = new AbortController();
     const signal = this.abort.signal;
     deps.host.registerRun(run, this);
 
+    // Per-instance wall clock (PLAN-v2 §6.2): a kill turns the run into `partial`, never an error.
+    let budgetTimer: NodeJS.Timeout | null = null;
+    if (this.opts) {
+      budgetTimer = setTimeout(() => {
+        if (run.status === 'running') { run.budgetHit = 'maxSeconds'; this.abort?.abort(); }
+      }, this.opts.budget.maxSeconds * 1000);
+    }
+
     bus.emit(this.id, runId, {
       kind: 'task_start',
       origin: task.origin,
       input: task.input,
       ...(task.context ? { context: task.context } : {}),
+      ...(task.contract ? { contract: task.contract } : {}),
+      ...(this.opts ? { budget: this.opts.budget } : {}),
     });
     this.setStatus('thinking');
 
-    state.pushHistory(this.id, { role: 'user', content: formatTaskInput(task) });
+    this.push({ role: 'user', content: this.opts ? task.input : formatTaskInput(task) });
 
     let finalText = '';
+    let lastText = '';
     let iterations = 0;
     let errorMessage: string | null = null;
+    let lastModel = this.cfg().model;
 
     try {
       for (let iteration = 1; iteration <= this.cfg().maxIterations; iteration++) {
-        if (signal.aborted) { run.status = 'cancelled'; break; }
+        if (signal.aborted) { run.status = run.budgetHit ? 'partial' : 'cancelled'; break; }
+        if (run.budgetHit) break;
         iterations = iteration;
         run.iteration = iteration;
 
         const liveCfg = config.get();
         const liveAgent = this.cfg();
-        const system = buildSystemPrompt(liveAgent, liveCfg, config.agentViews(), deps.env);
-        const trimmed = trimHistory(state.history(this.id), client.contextLimit(liveAgent.model));
+        const roster = config.agentViews();
+        const tools: ToolDef[] = toolDefsFor(this.role(), liveCfg, roster, depth);
+        const system = buildRolePrompt(liveAgent, liveCfg, roster, deps.env, {
+          toolNames: tools.map((t) => t.function.name),
+        });
+        const trimmed = trimHistory(this.history(), client.contextLimit(liveAgent.model));
         const messages: ChatMessage[] = [{ role: 'system', content: system }, ...trimmed];
-        const tools: ToolDef[] = toolDefs();
+        const maxTokens = this.callTokenCap(run);
+        const escalate = this.shouldEscalate(run);
 
+        let picked = router.pick(liveAgent, 0, { escalate });
+        lastModel = picked.model;
+        this.lastModelUsed = picked.model;
         const llmEv = bus.emit(this.id, runId, {
           kind: 'llm_call',
-          model: liveAgent.model,
+          model: picked.model,
+          format: picked.format,
           iteration,
           messageCount: messages.length,
           status: 'streaming',
@@ -244,11 +334,21 @@ export class AgentRuntime {
         let acc = newAcc();
         let finishReason: string | null = null;
         let streamFailed = false;
+        let modelAttempt = 0;
+        let backoff = 0;
 
-        for (let attempt = 0; ; attempt++) {
+        for (;;) {
           try {
             const r = await client.streamChat(
-              { model: liveAgent.model, messages, tools, sessionId: state.sessionId(this.id) },
+              {
+                model: picked.model,
+                format: picked.format,
+                messages,
+                tools,
+                sessionId: requestId,
+                ...(maxTokens !== undefined ? { maxTokens } : {}),
+                ...(liveAgent.temperature !== undefined ? { temperature: liveAgent.temperature } : {}),
+              },
               this.handlers(runId, iteration, () => acc, callUsage, run),
               signal,
             );
@@ -256,9 +356,37 @@ export class AgentRuntime {
             break;
           } catch (e) {
             const err = e instanceof ApiError ? e : new ApiError('Unknown', fmtErr(e));
-            if (err.type === 'Abort' || signal.aborted) { run.status = 'cancelled'; streamFailed = true; break; }
-            if (err.retryable && attempt < MAX_STREAM_ATTEMPTS - 1) {
-              const wait = err.retryAfterMs ?? Math.min(5000 * 2 ** attempt, 60000) + Math.floor(Math.random() * 500);
+            if (err.type === 'Abort' || signal.aborted) {
+              run.status = run.budgetHit ? 'partial' : 'cancelled';
+              streamFailed = true;
+              break;
+            }
+            // `next` is computed BEFORE marking the model unavailable, otherwise the shortened
+            // chain would shift the index and skip the very next fallback (PLAN-v2 §4).
+            const next = router.pick(liveAgent, modelAttempt + 1, { escalate });
+            const switchable = isSwitchable(err.type) && !picked.last;
+            if (err.type === 'ModelError' || err.type === 'DataPolicyError') {
+              router.markUnavailable(picked.model, err);
+            }
+            if (switchable) {
+              bus.emit(this.id, runId, {
+                kind: 'info',
+                message: `Fallback: ${picked.model} → ${next.model} (${reasonIt(err)})`,
+              });
+              if (acc.reasoning || acc.text || acc.calls.size) acc = newAcc();
+              modelAttempt += 1;
+              picked = next;
+              lastModel = picked.model;
+              this.lastModelUsed = picked.model;
+              bus.patch(this.id, llmEv.id, { set: { model: picked.model, format: picked.format } });
+              this.setStatus('thinking', `fallback ${picked.model}`);
+              if (err.type === 'RateLimit') {
+                try { await sleep(300, signal); } catch { run.status = 'cancelled'; streamFailed = true; break; }
+              }
+              continue;
+            }
+            if (err.retryable && backoff < MAX_STREAM_ATTEMPTS - 1) {
+              const wait = err.retryAfterMs ?? Math.min(5000 * 2 ** backoff, 60000) + Math.floor(Math.random() * 500);
               bus.emit(this.id, runId, {
                 kind: 'error',
                 message: err.type === 'RateLimit'
@@ -272,11 +400,12 @@ export class AgentRuntime {
                 bus.emit(this.id, runId, { kind: 'info', message: 'Risposta parziale scartata prima di riprovare' });
                 acc = newAcc();
               }
+              backoff += 1;
               this.setStatus('thinking', 'nuovo tentativo');
               try {
                 await sleep(wait, signal);
               } catch {
-                run.status = 'cancelled'; streamFailed = true; break;
+                run.status = run.budgetHit ? 'partial' : 'cancelled'; streamFailed = true; break;
               }
               continue;
             }
@@ -296,7 +425,7 @@ export class AgentRuntime {
 
         bus.flushAgent(this.id);
         if (streamFailed) break;
-        if (signal.aborted) { run.status = 'cancelled'; break; }
+        if (signal.aborted) { run.status = run.budgetHit ? 'partial' : 'cancelled'; break; }
 
         // ---- assistant message complete
         const calls = [...acc.calls.values()].sort((a, b) => a.index - b.index);
@@ -310,7 +439,8 @@ export class AgentRuntime {
         };
         if (acc.reasoning) assistant.reasoning_content = acc.reasoning;
         if (calls.length) assistant.tool_calls = calls.map(toWire);
-        state.pushHistory(this.id, assistant);
+        this.push(assistant);
+        if (acc.text) lastText = acc.text;
 
         bus.patch(this.id, llmEv.id, {
           set: {
@@ -320,25 +450,47 @@ export class AgentRuntime {
             durationMs: Date.now() - callStart,
           },
         });
+        // Token budget is checked after every call, before deciding to continue (PLAN-v2 §6.2).
+        if (this.opts && !run.budgetHit) {
+          const used = run.usage.promptTokens + run.usage.completionTokens;
+          if (used > this.opts.budget.maxTokens) run.budgetHit = 'maxTokens';
+        }
         this.emitStatus();
 
         if (!calls.length) {
           if (acc.textEvId) bus.patch(this.id, acc.textEvId, { set: { final: true } });
-          run.status = 'done';
+          run.status = run.budgetHit ? 'partial' : 'done';
           finalText = acc.text;
+          break;
+        }
+
+        if (this.opts && !run.budgetHit) {
+          const cap = this.opts.budget.maxToolCalls;
+          if ((run.toolCalls ?? 0) + calls.length > cap) run.budgetHit = 'maxToolCalls';
+        }
+        if (run.budgetHit) {
+          // Keep the history API-valid even though this instance is done (PLAN-v2 §6.2).
+          for (const c of calls) {
+            this.push({ role: 'tool', tool_call_id: c.id, content: '[budget exhausted]' });
+            if (c.evId) bus.patch(this.id, c.evId, { set: { status: 'error' } });
+          }
           break;
         }
 
         this.setStatus('tool');
         const results = await this.executeToolCalls(calls, run, iteration, signal);
+        run.toolCalls = (run.toolCalls ?? 0) + calls.length;
         for (const c of calls) {
-          state.pushHistory(this.id, {
+          this.push({
             role: 'tool',
             tool_call_id: c.id,
-            content: truncateForModel(results.get(c.id) ?? '[cancelled by user]', MODEL_OUTPUT_CAP),
+            content: truncateForModel(
+              results.get(c.id) ?? '[cancelled by user]',
+              POOL_TOOLS.has(c.name) ? POOL_OUTPUT_CAP : MODEL_OUTPUT_CAP,
+            ),
           });
         }
-        if (signal.aborted) { run.status = 'cancelled'; break; }
+        if (signal.aborted) { run.status = run.budgetHit ? 'partial' : 'cancelled'; break; }
         if (iteration === this.cfg().maxIterations) {
           run.status = 'error';
           errorMessage = 'Limite di iterazioni raggiunto';
@@ -347,40 +499,74 @@ export class AgentRuntime {
         }
       }
     } finally {
+      if (budgetTimer) clearTimeout(budgetTimer);
       bus.flushAgent(this.id);
     }
 
     if (run.status === 'running') {
-      run.status = 'error';
-      errorMessage = errorMessage ?? 'Esecuzione interrotta';
+      if (run.budgetHit) run.status = 'partial';
+      else { run.status = 'error'; errorMessage = errorMessage ?? 'Esecuzione interrotta'; }
     }
     run.finishedAt = Date.now();
-    const status: TaskResult['status'] = run.status === 'done' ? 'done' : (run.status === 'cancelled' ? 'cancelled' : 'error');
+    const status: TaskResult['status'] = run.status === 'done'
+      ? 'done'
+      : (run.status === 'cancelled' ? 'cancelled' : (run.status === 'partial' ? 'partial' : 'error'));
 
-    bus.emit(this.id, runId, {
+    const taskEnd = bus.emit(this.id, runId, {
       kind: 'task_end',
       status,
       durationMs: run.finishedAt - startedAt,
       usage: cloneUsage(run.usage),
       iterations,
+      ...(run.budgetHit ? { budgetHit: run.budgetHit } : {}),
+      ...(this.opts ? { toolCalls: run.toolCalls ?? 0 } : {}),
     });
 
-    const text = status === 'done' ? finalText : (errorMessage ?? (status === 'cancelled' ? 'annullato' : 'errore'));
+    const text = status === 'done'
+      ? finalText
+      : (status === 'partial'
+        ? (finalText || lastText || errorMessage || 'parziale')
+        : (errorMessage ?? (status === 'cancelled' ? 'annullato' : 'errore')));
+    const isUserRun = task.origin.kind === 'user';
     deps.send('run:finished', {
       runId,
       agentId: this.id,
       status,
-      isUserRun: task.origin.kind === 'user',
+      isUserRun,
       finalText: text,
       usage: cloneUsage(run.usage),
+      // T0 unless the turn actually delegated (PLAN-v2 §6.1); read before the ctx is recycled.
+      ...(isUserRun ? { tier: deps.host.requestTier(requestId) ?? 'T0' } : {}),
     });
-    deps.host.onRunFinished(run, text);
+    deps.host.onRunFinished(run, text, taskEnd.id);
     deps.host.unregisterRun(runId);
     this.current = null;
     this.abort = null;
     this.setStatus(status === 'error' ? 'error' : 'idle');
 
-    return { status, text, runId, usage: cloneUsage(run.usage) };
+    return {
+      status,
+      text,
+      runId,
+      usage: cloneUsage(run.usage),
+      toolCalls: run.toolCalls ?? 0,
+      ...(run.budgetHit ? { budgetHit: run.budgetHit } : {}),
+    };
+  }
+
+  /** `max_tokens` derived from what is left of the instance budget (PLAN-v2 §6.2). */
+  private callTokenCap(run: RunState): number | undefined {
+    if (!this.opts) return undefined;
+    const used = run.usage.promptTokens + run.usage.completionTokens;
+    const left = this.opts.budget.maxTokens - used;
+    return Math.max(MIN_CALL_TOKENS, Math.min(MAX_CALL_TOKENS, left));
+  }
+
+  /** Orchestrator escalates on T3; instances carry the flag decided at spawn (PLAN-v2 §4). */
+  private shouldEscalate(run: RunState): boolean {
+    if (this.opts) return this.opts.escalate;
+    if (this.role() !== 'orchestrator') return false;
+    return this.deps.host.requestTier(run.requestId ?? run.runId) === 'T3';
   }
 
   // ------------------------------------------------------------ stream handlers
@@ -440,6 +626,7 @@ export class AgentRuntime {
 
   // ------------------------------------------------------------ tool calls
 
+  /** Strictly sequential in v2: batching now lives inside delegate_tasks (PLAN-v2 §8). */
   private async executeToolCalls(
     calls: AccCall[],
     run: RunState,
@@ -447,17 +634,9 @@ export class AgentRuntime {
     signal: AbortSignal,
   ): Promise<Map<string, string>> {
     const results = new Map<string, string>();
-    // Consecutive delegate_task calls run in parallel; everything else is sequential (PLAN §5.3).
-    const groups: AccCall[][] = [];
     for (const c of calls) {
-      const last = groups[groups.length - 1];
-      if (c.name === 'delegate_task' && last && last[0].name === 'delegate_task') last.push(c);
-      else groups.push([c]);
-    }
-    for (const group of groups) {
       if (signal.aborted) break;
-      const done = await Promise.all(group.map((c) => this.runOneCall(c, run, iteration, signal)));
-      for (let i = 0; i < group.length; i++) results.set(group[i].id, done[i]);
+      results.set(c.id, await this.runOneCall(c, run, iteration, signal));
     }
     return results;
   }
@@ -479,8 +658,10 @@ export class AgentRuntime {
       return msg;
     }
     const args = parsed.args as Record<string, unknown>;
-    if (!toolNames().includes(c.name)) {
-      const msg = `ERROR: unknown tool ${c.name}. Available: ${toolNames().join(', ')}`;
+    const depth = run.origin.kind === 'delegation' ? run.origin.depth : 0;
+    const allowed = toolNamesFor(this.role(), this.deps.config.get(), this.deps.host.roster(), depth);
+    if (!allowed.includes(c.name)) {
+      const msg = `ERROR: unknown tool ${c.name}. Available: ${allowed.join(', ')}`;
       patch({ status: 'error', args });
       return msg;
     }
@@ -489,13 +670,19 @@ export class AgentRuntime {
     patch({ status: 'running', args });
 
     const t0 = Date.now();
-    const view = this.deps.config.agentView(this.cfg());
+    const template = this.cfg();
+    const view = this.deps.config.agentView(template);
     const r = await execute(c.name, args, {
-      agent: this.cfg(),
-      agentView: view,
+      // The permission modal shows the TEMPLATE name/colour but the INSTANCE id, so
+      // gate.cancelRun/cancelAgent still match the running instance (PLAN-v2 §8).
+      agent: { ...template, id: this.id },
+      agentView: { ...view, id: this.id },
       run,
       signal,
       cfg: () => this.deps.config.get(),
+      roster: () => this.deps.host.roster(),
+      role: this.role(),
+      depth,
       gate: this.deps.gate,
       orchestrator: this.deps.host,
       callId: c.id,
@@ -514,12 +701,16 @@ export class AgentRuntime {
         durationMs,
       },
     });
-    log(`tool ${c.name} for ${this.cfg().name}: ok=${r.ok} ${durationMs}ms (iter ${iteration})`);
+    log(`tool ${c.name} for ${template.name}: ok=${r.ok} ${durationMs}ms (iter ${iteration})`);
     return r.output;
   }
 }
 
 // ================================================================ helpers
+
+function kilo(n: number): string {
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+}
 
 function newAcc(): Acc {
   return { reasoning: '', text: '', reasoningEvId: null, textEvId: null, calls: new Map() };
@@ -529,7 +720,8 @@ function toWire(c: AccCall): ToolCall {
   return { id: c.id, type: 'function', function: { name: c.name, arguments: c.args || '{}' } };
 }
 
-/** User input goes verbatim; delegations get a framed header (PLAN §5.2). */
+/** User input goes verbatim; v1 delegations get a framed header (PLAN §5.2). v2 instances receive
+ *  an already-complete contract message and bypass this (PLAN-v2 §9). */
 export function formatTaskInput(task: Task): string {
   if (task.origin.kind === 'user') return task.input;
   const head = `[Task delegated by ${task.origin.fromName}]\n${task.input}`;
@@ -560,27 +752,7 @@ export function parseArgs(raw: string): { args?: Record<string, unknown>; error?
   return { error: lastError };
 }
 
-function firstBalancedObject(s: string): string | null {
-  const start = s.indexOf('{');
-  if (start < 0) return null;
-  let depth = 0;
-  let quote: string | null = null;
-  for (let i = start; i < s.length; i++) {
-    const ch = s[i];
-    if (quote) {
-      if (ch === '\\') { i++; continue; }
-      if (ch === quote) quote = null;
-      continue;
-    }
-    if (ch === '"' || ch === "'") { quote = ch; continue; }
-    if (ch === '{') depth++;
-    else if (ch === '}') {
-      depth--;
-      if (depth === 0) return s.slice(start, i + 1);
-    }
-  }
-  return null;
-}
+export { firstBalancedObject };
 
 /** Drops oldest whole turns until the estimate fits 70% of the context (PLAN §5.4). */
 export function trimHistory(history: ChatMessage[], contextLimit: number): ChatMessage[] {
@@ -603,6 +775,7 @@ function describeApiError(err: ApiError): string {
   switch (err.type) {
     case 'AuthError': return `Chiave API non valida o non autorizzata: ${err.message}`;
     case 'ModelError': return `Modello non disponibile: ${err.message}`;
+    case 'DataPolicyError': return `Data policy non accettata per questo modello: ${err.message}`;
     case 'RateLimit': return `Limite di utilizzo del piano raggiunto: ${err.message}`;
     case 'Network': return `Errore di rete: ${err.message}`;
     case 'Server': return `Errore del servizio (${err.status}): ${err.message}`;

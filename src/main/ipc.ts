@@ -5,11 +5,12 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { BrowserWindow, IpcMainInvokeEvent, dialog, ipcMain, shell } from 'electron';
 import type {
-  AgentId, AgentInput, AppInfo, ConfigPatch, ConfigSnapshot, ConsoleEvent, KeyValidationResult,
-  ModelInfo, PermissionDecision, RuntimeSnapshot, SetupPayload,
+  AgentId, AgentInput, AgentRole, AppInfo, ConfigPatch, ConfigSnapshot, ConsoleEvent,
+  KeyValidationResult, ModelInfo, PermissionDecision, RuntimeSnapshot, SetupPayload,
 } from '../shared/types';
 import { OpenCodeClient, reasonOf, toApiError } from './api';
-import { ConfigStore } from './config';
+import { ConfigStore, defaultPrompt } from './config';
+import { ContractsLog, ROLE_VALUES } from './contracts';
 import { PermissionGate } from './permissions';
 import { Orchestrator } from './orchestrator';
 import { ConsoleBus, StateStore } from './state';
@@ -28,22 +29,27 @@ export const INVOKE_CHANNELS = [
   'config:addAgent',
   'config:updateAgent',
   'config:removeAgent',
+  'config:defaultPrompt',
   'config:chooseWorkspace',
   'config:resetAll',
   'chat:send',
   'chat:cancel',
   'agent:cancel',
   'agent:clearHistory',
+  'instance:close',
   'console:getEvents',
   'console:clear',
   'runtime:getSnapshot',
   'permission:respond',
   'askUser:respond',
   'shell:openPath',
+  'logs:openContracts',
+  'shell:openExternal',
 ] as const;
 
 export interface IpcDeps {
   config: ConfigStore;
+  contracts: ContractsLog;
   state: StateStore;
   bus: ConsoleBus;
   client: OpenCodeClient;
@@ -158,6 +164,13 @@ export function registerHandlers(deps: IpcDeps): void {
     return config.removeAgent(id);
   });
 
+  handle('config:defaultPrompt', (_e, role) => {
+    if (typeof role !== 'string' || !ROLE_VALUES.includes(role as AgentRole)) {
+      throw new Error('Ruolo non valido');
+    }
+    return defaultPrompt(role as AgentRole);
+  });
+
   handle('config:chooseWorkspace', async () => {
     const win = deps.getWindow();
     const opts = {
@@ -197,6 +210,11 @@ export function registerHandlers(deps: IpcDeps): void {
   handle('agent:clearHistory', (_e, agentId) => {
     if (typeof agentId !== 'string') throw new Error('Agente non valido');
     orchestrator.clearHistory(agentId as AgentId);
+  });
+
+  handle('instance:close', (_e, instanceId) => {
+    if (typeof instanceId !== 'string') throw new Error('Istanza non valida');
+    orchestrator.closeInstance(instanceId as AgentId);
   });
 
   // ------------------------------------------------------------ console
@@ -243,6 +261,26 @@ export function registerHandlers(deps: IpcDeps): void {
     if (!fs.existsSync(abs)) throw new Error('Percorso inesistente');
     const err = await shell.openPath(abs);
     if (err) throw new Error(err);
+  });
+
+  handle('logs:openContracts', async () => {
+    const file = await deps.contracts.ensureFile();
+    const err = await shell.openPath(file);
+    if (err) throw new Error(err);
+  });
+
+  // Only the OpenCode workspace opt-in link from a DataPolicyError toast (PLAN-v2 §3).
+  handle('shell:openExternal', async (_e, raw) => {
+    let url: URL;
+    try {
+      url = new URL(String(raw ?? ''));
+    } catch {
+      throw new Error('URL non valido');
+    }
+    if (url.protocol !== 'https:' || (url.hostname !== 'opencode.ai' && url.hostname !== 'www.opencode.ai')) {
+      throw new Error('Collegamento non consentito');
+    }
+    await shell.openExternal(url.toString());
   });
 
   log(`ipc: ${INVOKE_CHANNELS.length} handlers registered`);

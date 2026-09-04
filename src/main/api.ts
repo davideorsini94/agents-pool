@@ -2,7 +2,10 @@
 // IMPORTANT: no 'electron' import — scripts/api-smoke.mjs loads this file in a plain Node process.
 
 import * as path from 'node:path';
-import type { ChatMessage, KeyValidationResult, ModelInfo, Usage } from '../shared/types';
+import type {
+  ChatMessage, KeyValidationResult, ModelFormat, ModelInfo, ModelPrivacy, Usage,
+} from '../shared/types';
+import { buildResponsesBody, mapResponsesEvent, newResponsesState, ResponsesStreamState } from './responses';
 import {
   addUsage, atomicWrite, emptyUsage, isRecord, linkSignal, logWarn, readJson,
 } from './util';
@@ -15,7 +18,8 @@ const IDLE_TIMEOUT_MS = 120000;
 const MODELS_CACHE_TTL_MS = 24 * 3600 * 1000;
 
 export type ApiErrorType =
-  | 'AuthError' | 'ModelError' | 'RateLimit' | 'Server' | 'Network' | 'Abort' | 'Protocol' | 'Unknown';
+  | 'AuthError' | 'ModelError' | 'DataPolicyError' | 'RateLimit' | 'Server' | 'Network' | 'Abort'
+  | 'Protocol' | 'Unknown';
 
 export class ApiError extends Error {
   readonly status: number;
@@ -55,7 +59,27 @@ export interface StreamRequest {
   tools?: ToolDef[];
   sessionId: string;
   maxTokens?: number;
+  /** Wire format of this model; default 'chat'. Chosen by ModelRouter (PLAN-v2 §4, §5). */
+  format?: ModelFormat;
+  temperature?: number;
 }
+
+/**
+ * One row of the static MODEL_TABLE (PLAN-v2 §11.3): measured facts models.dev does not carry.
+ * Declared here (electron-free) and populated in config.ts, which injects it into OpenCodeClient
+ * and ModelRouter so both stay loadable from scripts/api-smoke.mjs.
+ */
+export interface ModelTableEntry {
+  format: ModelFormat;
+  privacy: ModelPrivacy;
+  costIn?: number;                 // USD per 1M input tokens
+  costOut?: number;                // USD per 1M output tokens
+  bucketUsd?: number;              // quota bucket the model draws from
+  reqPer5h?: number;               // requests per 5 h window
+  jsonStrict?: boolean;            // emits the requested JSON with no prose around it
+  notes?: string;                  // shown as tooltip / badge (Italian, user-visible)
+}
+export type ModelTable = Record<string, ModelTableEntry>;
 
 interface ModelsCacheFile { fetchedAt: number; models: ModelInfo[] }
 
@@ -64,14 +88,16 @@ export class OpenCodeClient {
   private modelsFetchedAt = 0;
   private modelsById = new Map<string, ModelInfo>();
   private readonly cacheFile: string | null;
+  private readonly modelTable: ModelTable;
   private inFlightModels: Promise<ModelInfo[]> | null = null;
 
   constructor(
     private readonly getKey: () => string | null,
     private readonly version: string,
-    opts?: { cacheDir?: string },
+    opts?: { cacheDir?: string; modelTable?: ModelTable },
   ) {
     this.cacheFile = opts?.cacheDir ? path.join(opts.cacheDir, 'models-cache.json') : null;
+    this.modelTable = opts?.modelTable ?? {};
   }
 
   // ------------------------------------------------------------ headers
@@ -149,7 +175,7 @@ export class OpenCodeClient {
       await atomicWrite(this.cacheFile, JSON.stringify({ fetchedAt: this.modelsFetchedAt, models: list }))
         .catch((e) => logWarn('models cache write failed', e));
     }
-    return list;
+    return this.models;
   }
 
   private async fetchModelIds(): Promise<string[]> {
@@ -172,11 +198,35 @@ export class OpenCodeClient {
     }
   }
 
-  private setModels(list: ModelInfo[], fetchedAt: number): void {
-    this.models = list;
-    this.modelsFetchedAt = fetchedAt;
-    this.modelsById = new Map(list.map((m) => [m.id, m]));
+  /**
+   * MODEL_TABLE over models.dev (PLAN-v2 §1 api.ts): models.dev wins for price/context when it
+   * has them, the table adds format/privacy/bucket/req-per-5h/jsonStrict/notes, and unknown ids
+   * fall back to `chat` / `zdr` with no badges. Applied on every setModels() so a models-cache.json
+   * written before the table existed still gets the badges.
+   */
+  private mergeTable(list: ModelInfo[]): ModelInfo[] {
+    return list.map((m) => {
+      const t = this.modelTable[m.id];
+      const out: ModelInfo = { ...m, format: t?.format ?? 'chat', privacy: t?.privacy ?? 'zdr' };
+      if (!t) return out;
+      if (out.costIn === undefined && t.costIn !== undefined) out.costIn = t.costIn;
+      if (out.costOut === undefined && t.costOut !== undefined) out.costOut = t.costOut;
+      if (t.bucketUsd !== undefined) out.bucketUsd = t.bucketUsd;
+      if (t.reqPer5h !== undefined) out.reqPer5h = t.reqPer5h;
+      if (t.jsonStrict !== undefined) out.jsonStrict = t.jsonStrict;
+      if (t.notes !== undefined) out.notes = t.notes;
+      return out;
+    });
   }
+
+  private setModels(list: ModelInfo[], fetchedAt: number): void {
+    this.models = this.mergeTable(list);
+    this.modelsFetchedAt = fetchedAt;
+    this.modelsById = new Map(this.models.map((m) => [m.id, m]));
+  }
+
+  /** Format hint from the static table only (the router adds prefixes and user overrides). */
+  tableFormat(model: string): ModelFormat | undefined { return this.modelTable[model]?.format; }
 
   modelInfo(id: string): ModelInfo | undefined { return this.modelsById.get(id); }
 
@@ -195,14 +245,16 @@ export class OpenCodeClient {
 
   // ------------------------------------------------------------ streamChat
 
+  /** Single entry point for both wire formats (PLAN-v2 §5 "Dispatch"). */
   async streamChat(req: StreamRequest, h: StreamHandlers, signal: AbortSignal): Promise<StreamResult> {
+    return req.format === 'responses'
+      ? this.streamResponses(req, h, signal)
+      : this.streamChatCompletions(req, h, signal);
+  }
+
+  private async streamChatCompletions(req: StreamRequest, h: StreamHandlers, signal: AbortSignal): Promise<StreamResult> {
     const { controller, dispose } = linkSignal(signal);
-    let idleTimedOut = false;
-    let idleTimer: NodeJS.Timeout | null = null;
-    const bumpIdle = () => {
-      if (idleTimer) clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => { idleTimedOut = true; controller.abort(); }, IDLE_TIMEOUT_MS);
-    };
+    const sse: SseState = { sawDone: false, idleTimedOut: false };
 
     const body: Record<string, unknown> = {
       model: req.model,
@@ -211,19 +263,17 @@ export class OpenCodeClient {
       stream_options: { include_usage: true },
     };
     if (req.maxTokens !== undefined) body.max_tokens = req.maxTokens;
+    if (req.temperature !== undefined) body.temperature = req.temperature;
     if (req.tools && req.tools.length) { body.tools = req.tools; body.tool_choice = 'auto'; }
 
     let finishReason: string | null = null;
     let rawUsage: Record<string, unknown> | null = null;
     let cost: number | undefined;
-    let sawDone = false;
-    let postDoneTimer: NodeJS.Timeout | null = null;
     let promptChars = 0;
     let outChars = 0;
     for (const m of req.messages) if (typeof m.content === 'string') promptChars += m.content.length;
 
     try {
-      bumpIdle();
       const res = await fetch(`${BASE_URL}/chat/completions`, {
         method: 'POST',
         headers: this.headers(req.sessionId),
@@ -233,81 +283,55 @@ export class OpenCodeClient {
       if (!res.ok) throw await httpError(res);
       if (!res.body) throw new ApiError('Protocol', 'Risposta senza corpo');
 
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder('utf-8');
-      let buffer = '';
+      await readSse(res, controller, sse, (payload) => {
+        let ev: unknown;
+        try {
+          ev = JSON.parse(payload);
+        } catch {
+          return 'continue'; // ignore unparseable keep-alive noise
+        }
+        if (!isRecord(ev)) return 'continue';
+        if (isRecord(ev.error)) throw errorFromBody(ev, 0);
 
-      // NOTE: the gateway emits a trailing {"choices":[],"cost":"0.0012"} chunk AFTER
-      // `data: [DONE]`, so we keep reading past [DONE] (with a 2 s cap) to capture the cost.
-      readLoop: for (;;) {
-        const chunk = await reader.read();
-        if (chunk.done) break;
-        bumpIdle();
-        buffer += decoder.decode(chunk.value, { stream: true });
-        // Split on \n; keep the trailing partial line in the buffer.
-        let nl: number;
-        while ((nl = buffer.indexOf('\n')) >= 0) {
-          const line = buffer.slice(0, nl).replace(/\r$/, '');
-          buffer = buffer.slice(nl + 1);
-          if (!line.startsWith('data:')) continue;
-          const payload = line.slice(5).trim();
-          if (!payload) continue;
-          if (payload === '[DONE]') {
-            sawDone = true;
-            if (!postDoneTimer) postDoneTimer = setTimeout(() => controller.abort(), 2000);
-            continue;
-          }
-          let ev: unknown;
-          try {
-            ev = JSON.parse(payload);
-          } catch {
-            continue; // ignore unparseable keep-alive noise
-          }
-          if (!isRecord(ev)) continue;
-          if (isRecord(ev.error)) throw errorFromBody(ev, 0);
-
-          const choices = Array.isArray(ev.choices) ? ev.choices : [];
-          const first = choices.length && isRecord(choices[0]) ? choices[0] as Record<string, unknown> : null;
-          if (first) {
-            if (typeof first.finish_reason === 'string') finishReason = first.finish_reason;
-            const delta = isRecord(first.delta) ? first.delta : null;
-            if (delta) {
-              const reasoning = pickString(delta.reasoning_content) ?? pickString(delta.reasoning);
-              if (reasoning) { outChars += reasoning.length; h.onReasoning(reasoning); }
-              const content = pickString(delta.content);
-              if (content) { outChars += content.length; h.onText(content); }
-              if (Array.isArray(delta.tool_calls)) {
-                for (let i = 0; i < delta.tool_calls.length; i++) {
-                  const raw = delta.tool_calls[i];
-                  if (!isRecord(raw)) continue;
-                  const fn = isRecord(raw.function) ? raw.function : null;
-                  const d: ToolCallDelta = {
-                    index: typeof raw.index === 'number' ? raw.index : i,
-                  };
-                  if (typeof raw.id === 'string' && raw.id) d.id = raw.id;
-                  if (fn && typeof fn.name === 'string' && fn.name) d.name = fn.name;
-                  if (fn && typeof fn.arguments === 'string' && fn.arguments) d.args = fn.arguments;
-                  if (d.args) outChars += d.args.length;
-                  h.onToolCallDelta(d);
-                }
+        const choices = Array.isArray(ev.choices) ? ev.choices : [];
+        const first = choices.length && isRecord(choices[0]) ? choices[0] as Record<string, unknown> : null;
+        if (first) {
+          if (typeof first.finish_reason === 'string') finishReason = first.finish_reason;
+          const delta = isRecord(first.delta) ? first.delta : null;
+          if (delta) {
+            const reasoning = pickString(delta.reasoning_content) ?? pickString(delta.reasoning);
+            if (reasoning) { outChars += reasoning.length; h.onReasoning(reasoning); }
+            const content = pickString(delta.content);
+            if (content) { outChars += content.length; h.onText(content); }
+            if (Array.isArray(delta.tool_calls)) {
+              for (let i = 0; i < delta.tool_calls.length; i++) {
+                const raw = delta.tool_calls[i];
+                if (!isRecord(raw)) continue;
+                const fn = isRecord(raw.function) ? raw.function : null;
+                const d: ToolCallDelta = {
+                  index: typeof raw.index === 'number' ? raw.index : i,
+                };
+                if (typeof raw.id === 'string' && raw.id) d.id = raw.id;
+                if (fn && typeof fn.name === 'string' && fn.name) d.name = fn.name;
+                if (fn && typeof fn.arguments === 'string' && fn.arguments) d.args = fn.arguments;
+                if (d.args) outChars += d.args.length;
+                h.onToolCallDelta(d);
               }
             }
           }
-          if (isRecord(ev.usage)) rawUsage = ev.usage;
-          cost = pickCost(ev.cost)
-            ?? (isRecord(ev.usage) ? pickCost((ev.usage as Record<string, unknown>).cost) : undefined)
-            ?? cost;
-          if (sawDone && rawUsage && cost !== undefined) break readLoop;
         }
-      }
+        if (isRecord(ev.usage)) rawUsage = ev.usage;
+        cost = pickCost(ev.cost)
+          ?? (isRecord(ev.usage) ? pickCost((ev.usage as Record<string, unknown>).cost) : undefined)
+          ?? cost;
+        return (sse.sawDone && rawUsage && cost !== undefined) ? 'stop' : 'continue';
+      });
     } catch (e) {
-      if (idleTimedOut) throw new ApiError('Network', 'Nessuna risposta dal modello per 120 secondi');
+      if (sse.idleTimedOut) throw new ApiError('Network', 'Nessuna risposta dal modello per 120 secondi');
       const err = toApiError(e);
       // An abort we caused ourselves while waiting for the post-[DONE] cost chunk is not an error.
-      if (!(sawDone && err.type === 'Abort' && !signal.aborted)) throw err;
+      if (!(sse.sawDone && err.type === 'Abort' && !signal.aborted)) throw err;
     } finally {
-      if (idleTimer) clearTimeout(idleTimer);
-      if (postDoneTimer) clearTimeout(postDoneTimer);
       dispose();
     }
 
@@ -327,6 +351,124 @@ export class OpenCodeClient {
     h.onUsage(usage);
     return { finishReason, usage };
   }
+
+  // ------------------------------------------------------------ streamResponses
+
+  /** POST /responses with the same StreamHandlers contract (PLAN-v2 §5, REQUIREMENTS §7). */
+  private async streamResponses(req: StreamRequest, h: StreamHandlers, signal: AbortSignal): Promise<StreamResult> {
+    const { controller, dispose } = linkSignal(signal);
+    const sse: SseState = { sawDone: false, idleTimedOut: false };
+    const st: ResponsesStreamState = newResponsesState();
+    let promptChars = 0;
+    let outChars = 0;
+    for (const m of req.messages) if (typeof m.content === 'string') promptChars += m.content.length;
+
+    try {
+      const res = await fetch(`${BASE_URL}/responses`, {
+        method: 'POST',
+        headers: this.headers(req.sessionId),
+        body: JSON.stringify(buildResponsesBody(req)),
+        signal: controller.signal,
+      });
+      if (!res.ok) throw await httpError(res);
+      if (!res.body) throw new ApiError('Protocol', 'Risposta senza corpo');
+
+      await readSse(res, controller, sse, (payload) => {
+        let ev: unknown;
+        try {
+          ev = JSON.parse(payload);
+        } catch {
+          return 'continue';
+        }
+        if (!isRecord(ev)) return 'continue';
+        const chars = mapResponsesEvent(ev, st, h, errorFromBody);
+        outChars += chars;
+        return st.completed ? 'stop' : 'continue';
+      });
+    } catch (e) {
+      if (sse.idleTimedOut) throw new ApiError('Network', 'Nessuna risposta dal modello per 120 secondi');
+      const err = toApiError(e);
+      if (!(st.completed && err.type === 'Abort' && !signal.aborted)) throw err;
+    } finally {
+      dispose();
+    }
+
+    let usage: Usage;
+    if (st.usage) {
+      usage = st.usage;
+      if (st.cost !== undefined) usage.cost = st.cost;
+      else if (!usage.cost) {
+        usage.cost = this.estimateCost(req.model, usage.promptTokens, usage.completionTokens);
+        usage.estimated = true;
+      }
+    } else {
+      usage = emptyUsage();
+      usage.promptTokens = Math.ceil(promptChars / 4);
+      usage.completionTokens = Math.ceil(outChars / 4);
+      usage.cost = st.cost ?? this.estimateCost(req.model, usage.promptTokens, usage.completionTokens);
+      usage.calls = 1;
+      usage.estimated = true;
+    }
+    h.onUsage(usage);
+    return { finishReason: st.finishReason, usage };
+  }
+}
+
+// ---------------------------------------------------------------- SSE reader
+
+export type SseDisposition = 'continue' | 'stop';
+export interface SseState { sawDone: boolean; idleTimedOut: boolean }
+
+/**
+ * Shared SSE loop for both formats (PLAN-v2 §5): line buffering across chunk boundaries, a 120 s
+ * idle watchdog, and the gateway's habit of emitting `{"choices":[],"cost":"…"}` AFTER
+ * `data: [DONE]` (so `[DONE]` only arms a 2 s cap instead of ending the loop). `onData` receives
+ * every non-empty `data:` payload except `[DONE]` and decides when to stop; `event:` lines are
+ * ignored (the payload carries its own `type`).
+ */
+export async function readSse(
+  res: Response,
+  controller: AbortController,
+  state: SseState,
+  onData: (payload: string) => SseDisposition,
+): Promise<void> {
+  let idleTimer: NodeJS.Timeout | null = null;
+  let postDoneTimer: NodeJS.Timeout | null = null;
+  const bumpIdle = (): void => {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => { state.idleTimedOut = true; controller.abort(); }, IDLE_TIMEOUT_MS);
+  };
+  const reader = (res.body as ReadableStream<Uint8Array>).getReader();
+  const decoder = new TextDecoder('utf-8');
+  let buffer = '';
+  try {
+    bumpIdle();
+    readLoop: for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      bumpIdle();
+      buffer += decoder.decode(chunk.value, { stream: true });
+      let nl: number;
+      while ((nl = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, nl).replace(/\r$/, '');
+        buffer = buffer.slice(nl + 1);
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (!payload) continue;
+        if (payload === '[DONE]') {
+          state.sawDone = true;
+          if (!postDoneTimer) postDoneTimer = setTimeout(() => controller.abort(), 2000);
+          continue;
+        }
+        if (onData(payload) === 'stop') break readLoop;
+      }
+    }
+  } finally {
+    if (idleTimer) clearTimeout(idleTimer);
+    if (postDoneTimer) clearTimeout(postDoneTimer);
+    // The responses branch stops on `response.completed` without an abort: release the socket.
+    try { void reader.cancel(); } catch { /* already closed */ }
+  }
 }
 
 // ---------------------------------------------------------------- helpers
@@ -335,7 +477,7 @@ function pickString(v: unknown): string | null {
   return typeof v === 'string' && v.length ? v : null;
 }
 
-function pickCost(v: unknown): number | undefined {
+export function pickCost(v: unknown): number | undefined {
   if (typeof v === 'number' && Number.isFinite(v)) return v;
   if (typeof v === 'string') {
     const n = Number.parseFloat(v);
@@ -371,10 +513,15 @@ async function httpError(res: Response): Promise<ApiError> {
   return mapStatus(res.status, bodyText || res.statusText || `HTTP ${res.status}`, retryAfter);
 }
 
-function errorFromBody(body: Record<string, unknown>, status: number, retryAfter?: number, fallback = ''): ApiError {
+/** Exported for responses.ts, which maps `response.failed` / `error` events through it. */
+export function errorFromBody(body: Record<string, unknown>, status: number, retryAfter?: number, fallback = ''): ApiError {
   const err = isRecord(body.error) ? body.error : null;
   const type = err && typeof err.type === 'string' ? err.type : '';
   const message = (err && typeof err.message === 'string' && err.message) || fallback || 'Errore API';
+  // Data-policy opt-in (muse-spark-*): HTTP 403 with the workspace URL in the message (PLAN-v2 §5).
+  if (type === 'DataPolicyError' || /data ?policy/i.test(type) || (!type && /data ?policy/i.test(message))) {
+    return new ApiError('DataPolicyError', message, status || 403);
+  }
   if (type === 'AuthError') return new ApiError('AuthError', message, status || 401);
   if (type === 'ModelError') return new ApiError('ModelError', message, status || 401);
   if (type === 'RateLimit' || type === 'RateLimitError') {
@@ -387,6 +534,9 @@ function errorFromBody(body: Record<string, unknown>, status: number, retryAfter
 function mapStatus(status: number, message: string, retryAfter?: number): ApiError {
   if (status === 401 || status === 403) return new ApiError('AuthError', message, status);
   if (status === 429) return new ApiError('RateLimit', message, status, retryAfter ?? 20000);
+  // The gateway answers 500 "not supported for format oa-compat" when a /responses-only model is
+  // called on /chat/completions: a model problem, so the router switches model instead of retrying.
+  if (status >= 500 && /not supported for format/i.test(message)) return new ApiError('ModelError', message, status);
   if (status >= 500) return new ApiError('Server', message, status, retryAfter);
   return new ApiError('Unknown', message, status);
 }
@@ -420,6 +570,7 @@ export function reasonOf(e: ApiError): 'auth' | 'network' | 'model' | 'rate_limi
     case 'AuthError': return 'auth';
     case 'Network': return 'network';
     case 'ModelError': return 'model';
+    case 'DataPolicyError': return 'model';
     case 'RateLimit': return 'rate_limit';
     default: return 'unknown';
   }

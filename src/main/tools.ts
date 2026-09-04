@@ -7,24 +7,24 @@ import * as fsp from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import type {
-  AgentConfig, AgentStatus, AgentView, AppConfig, RunState,
+  AgentConfig, AgentRole, AgentStatus, AgentView, AppConfig, RunState,
 } from '../shared/types';
 import type { ToolDef } from './api';
+import { poolLimits, roleOf } from './contracts';
 import { PermissionGate, resolvePath } from './permissions';
 import { fmtErr, isRecord, truncate } from './util';
 
 export interface ToolResult { ok: boolean; output: string; denied?: boolean }
 
-/** Implemented by Orchestrator; declared here so tools.ts never imports orchestrator.ts. */
+/** Who is calling a pool tool: the orchestrator run, or (with allowWorkerDelegation) an instance. */
+export interface ToolCaller { agent: AgentConfig; run: RunState }
+
+/** Implemented by Orchestrator (over InstancePool); declared here so tools.ts never imports it. */
 export interface OrchestratorApi {
-  delegate(
-    from: { agent: AgentConfig; run: RunState },
-    ref: string,
-    task: string,
-    context: string | undefined,
-    callId: string,
-  ): Promise<string>;
-  rosterInfo(): Array<{ id: string; name: string; description: string; model: string; status: AgentStatus; isMain: boolean }>;
+  delegateTasks(from: ToolCaller, args: Record<string, unknown>, callId: string): Promise<string>;
+  runPlanner(from: ToolCaller, args: Record<string, unknown>, callId: string): Promise<string>;
+  runVerifier(from: ToolCaller, args: Record<string, unknown>, callId: string): Promise<string>;
+  readArtifact(args: Record<string, unknown>): Promise<string>;
 }
 
 export interface ToolCtx {
@@ -33,6 +33,11 @@ export interface ToolCtx {
   run: RunState;
   signal: AbortSignal;
   cfg: () => AppConfig;
+  roster: () => AgentView[];
+  /** Role captured at spawn (PLAN-v2 §12: a running instance keeps the toolset it started with). */
+  role: AgentRole;
+  /** Delegation depth of the calling run: 0 for the orchestrator, ≥1 for an instance. */
+  depth: number;
   gate: PermissionGate;
   orchestrator: OrchestratorApi;
   callId: string;
@@ -47,7 +52,133 @@ const OUTPUT_BUFFER_CAP = 1024 * 1024;
 
 // ================================================================ definitions
 
-export function toolDefs(): ToolDef[] {
+/**
+ * Tool catalogue per role, recomputed at every iteration from live config (PLAN-v2 §8):
+ *  - orchestrator: pool tools (only while a template of that role exists) + read-only file lookups
+ *  - worker:       the v1 machine tools, plus delegation when the user enabled it and depth allows
+ *  - planner/verifier: read-only
+ * Nothing ever stalls when a tool is missing: the role prompts say how to proceed without it.
+ */
+export function toolDefsFor(role: AgentRole, cfg: AppConfig, roster: AgentView[], depth = 0): ToolDef[] {
+  const l = poolLimits(cfg);
+  const has = (r: AgentRole): boolean => roster.some((a) => roleOf(a) === r);
+  const firstName = (r: AgentRole): string => roster.find((a) => roleOf(a) === r)?.name ?? '—';
+  const all = ALL_TOOLS(l.maxParallelWorkers, l.maxWorkersPerRequest, l.correctionRounds, firstName);
+
+  const pick = (names: string[]): ToolDef[] => names
+    .map((n) => all.find((t) => t.function.name === n))
+    .filter((t): t is ToolDef => !!t);
+
+  if (role === 'orchestrator') {
+    const names: string[] = [];
+    if (has('worker')) names.push('delegate_tasks');
+    if (has('planner')) names.push('run_planner');
+    if (has('verifier')) names.push('run_verifier');
+    names.push('read_artifact', 'ask_user', 'read_file', 'list_directory');
+    return pick(names);
+  }
+  if (role === 'planner' || role === 'verifier') {
+    return pick(['read_file', 'list_directory', 'search_files']);
+  }
+  // worker
+  const names = ['read_file', 'write_file', 'edit_file', 'delete_path', 'list_directory',
+    'search_files', 'run_command', 'system_info', 'network_info'];
+  // A level-2 worker (depth 1) delegating creates level-3 instances, so maxDepth must be ≥ 3.
+  if (l.allowWorkerDelegation && has('worker') && depth + 2 <= l.maxDepth) {
+    names.push('delegate_tasks', 'read_artifact');
+  }
+  return pick(names);
+}
+
+export function toolNamesFor(role: AgentRole, cfg: AppConfig, roster: AgentView[], depth = 0): string[] {
+  return toolDefsFor(role, cfg, roster, depth).map((t) => t.function.name);
+}
+
+function ALL_TOOLS(
+  maxParallelWorkers: number,
+  maxWorkersPerRequest: number,
+  correctionRounds: number,
+  firstName: (r: AgentRole) => string,
+): ToolDef[] {
+  return [
+    def('delegate_tasks', `Run one batch of TaskContracts on worker instances and wait for all ResultContracts. Read-only tasks run in parallel, side_effects tasks one at a time. Limits (from settings): ${maxParallelWorkers} tasks per call, ${maxWorkersPerRequest} instances per request, ${correctionRounds} correction round(s) per task.`, {
+      type: 'object',
+      required: ['tier', 'tasks'],
+      properties: {
+        tier: { type: 'string', enum: ['T1', 'T2', 'T3'] },
+        tasks: {
+          type: 'array',
+          minItems: 1,
+          maxItems: maxParallelWorkers,
+          items: {
+            type: 'object',
+            required: ['task_id', 'role', 'objective', 'deliverable', 'acceptance', 'side_effects'],
+            properties: {
+              task_id: { type: 'string', description: 't1, t2, … unique in the request; reuse an id only for a correction re-run after run_verifier (or to continue a blocked task)' },
+              role: { type: 'string', description: 'worker template name from the Pool section (or a role name; falls back to the default worker)' },
+              objective: { type: 'string', description: 'one self-contained sentence, no pronouns, no references to the conversation' },
+              inputs: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  required: ['type'],
+                  properties: {
+                    type: { type: 'string', enum: ['text', 'artifact_ref', 'file'] },
+                    content: { type: 'string' },
+                    id: { type: 'string' },
+                    path: { type: 'string' },
+                  },
+                },
+              },
+              constraints: { type: 'array', items: { type: 'string' } },
+              deliverable: { type: 'string' },
+              acceptance: { type: 'string' },
+              side_effects: { type: 'boolean', description: 'true if the task writes files or runs commands' },
+              budget: {
+                type: 'object',
+                description: 'optional and advisory only: the system always applies the budget configured for the worker template, so do not try to restrict a task with it',
+                properties: {
+                  max_tokens: { type: 'integer' },
+                  max_tool_calls: { type: 'integer' },
+                  max_seconds: { type: 'integer' },
+                },
+              },
+            },
+          },
+        },
+      },
+    }),
+    def('run_planner', 'Ask a planner for an ordered task list (≤6) for a broad objective. Use only for T3.', {
+      type: 'object',
+      required: ['objective'],
+      properties: {
+        objective: { type: 'string' },
+        context: { type: 'string', description: 'facts already known; no pronouns' },
+        template: { type: 'string', description: `planner template name; default ${firstName('planner')}` },
+      },
+    }),
+    def('run_verifier', 'Adversarial check of the results of this request. The system supplies the original request, the TaskContracts and the outputs.', {
+      type: 'object',
+      properties: {
+        task_ids: { type: 'array', items: { type: 'string' }, description: 'default: all tasks of this request' },
+        critical: { type: 'boolean', description: 'true → stronger model' },
+        template: { type: 'string', description: `verifier template name; default ${firstName('verifier')}` },
+      },
+    }),
+    def('read_artifact', 'Read a stored artifact by id (artifact_ref in a ResultContract).', {
+      type: 'object',
+      required: ['id'],
+      properties: {
+        id: { type: 'string' },
+        offset: { type: 'integer', description: 'char offset, default 0' },
+        limit: { type: 'integer', description: 'chars, default 6000, max 20000' },
+      },
+    }),
+    ...v1Tools(),
+  ];
+}
+
+function v1Tools(): ToolDef[] {
   return [
     def('read_file', 'Read a UTF-8 text file. Relative paths resolve inside the workspace.', {
       type: 'object',
@@ -115,16 +246,6 @@ export function toolDefs(): ToolDef[] {
     }),
     def('system_info', 'Report OS, CPU, memory, user, shell and app paths as JSON.', { type: 'object', properties: {} }),
     def('network_info', 'Report network interfaces, routes and DNS configuration as JSON.', { type: 'object', properties: {} }),
-    def('delegate_task', 'Delegate a self-contained sub-task to a teammate and wait for its result.', {
-      type: 'object',
-      properties: {
-        agent: { type: 'string', description: 'Teammate name or id' },
-        task: { type: 'string', description: 'Self-contained instructions' },
-        context: { type: 'string', description: 'Extra background the teammate needs' },
-      },
-      required: ['agent', 'task'],
-    }),
-    def('list_agents', 'List the team: id, name, description, model, status.', { type: 'object', properties: {} }),
     def('ask_user', 'Ask the user a question and wait for the answer. Use only when truly blocked.', {
       type: 'object',
       properties: {
@@ -140,10 +261,6 @@ function def(name: string, description: string, parameters: Record<string, unkno
   return { type: 'function', function: { name, description, parameters } };
 }
 
-export function toolNames(): string[] {
-  return toolDefs().map((t) => t.function.name);
-}
-
 // ================================================================ dispatch
 
 export async function execute(
@@ -151,6 +268,12 @@ export async function execute(
   args: Record<string, unknown>,
   ctx: ToolCtx,
 ): Promise<ToolResult> {
+  // Defence in depth (PLAN-v2 §8): a worker calling delegate_tasks while delegation is off, or a
+  // planner trying to write, gets "unknown tool" even if the model invented the call.
+  const allowed = toolNamesFor(ctx.role, ctx.cfg(), ctx.roster(), ctx.depth);
+  if (!allowed.includes(name)) {
+    return { ok: false, output: `ERROR: unknown tool ${name}. Available: ${allowed.join(', ')}` };
+  }
   try {
     switch (name) {
       case 'read_file': return await readFile(args, ctx);
@@ -162,11 +285,13 @@ export async function execute(
       case 'run_command': return await runCommand(args, ctx);
       case 'system_info': return await systemInfo(ctx);
       case 'network_info': return await networkInfo(ctx);
-      case 'delegate_task': return await delegateTask(args, ctx);
-      case 'list_agents': return listAgents(ctx);
+      case 'delegate_tasks': return await delegateTasks(args, ctx);
+      case 'run_planner': return await runPlanner(args, ctx);
+      case 'run_verifier': return await runVerifier(args, ctx);
+      case 'read_artifact': return await readArtifact(args, ctx);
       case 'ask_user': return await askUser(args, ctx);
       default:
-        return { ok: false, output: `ERROR: unknown tool ${name}. Available: ${toolNames().join(', ')}` };
+        return { ok: false, output: `ERROR: unknown tool ${name}. Available: ${allowed.join(', ')}` };
     }
   } catch (e) {
     // Never let a tool crash the agent loop (PLAN §5.3).
@@ -606,25 +731,27 @@ async function networkInfo(ctx: ToolCtx): Promise<ToolResult> {
   };
 }
 
-// ---------------------------------------------------------------- team tools
+// ---------------------------------------------------------------- pool tools
 
-async function delegateTask(args: Record<string, unknown>, ctx: ToolCtx): Promise<ToolResult> {
-  const ref = reqStr(args, 'agent');
-  const task = reqStr(args, 'task');
-  const context = str(args, 'context');
-  const text = await ctx.orchestrator.delegate(
-    { agent: ctx.agent, run: ctx.run },
-    ref,
-    task,
-    context,
-    ctx.callId,
-  );
-  // Only a completed delegation starts with "Result from"; every rejection/failure path does not.
-  return { ok: text.startsWith('Result from '), output: text };
+/** All four delegate to InstancePool through OrchestratorApi; the pool owns caps and events. */
+async function delegateTasks(args: Record<string, unknown>, ctx: ToolCtx): Promise<ToolResult> {
+  const text = await ctx.orchestrator.delegateTasks({ agent: ctx.agent, run: ctx.run }, args, ctx.callId);
+  return { ok: !text.startsWith('ERROR'), output: text };
 }
 
-function listAgents(ctx: ToolCtx): ToolResult {
-  return { ok: true, output: JSON.stringify(ctx.orchestrator.rosterInfo(), null, 2) };
+async function runPlanner(args: Record<string, unknown>, ctx: ToolCtx): Promise<ToolResult> {
+  const text = await ctx.orchestrator.runPlanner({ agent: ctx.agent, run: ctx.run }, args, ctx.callId);
+  return { ok: !text.startsWith('ERROR'), output: text };
+}
+
+async function runVerifier(args: Record<string, unknown>, ctx: ToolCtx): Promise<ToolResult> {
+  const text = await ctx.orchestrator.runVerifier({ agent: ctx.agent, run: ctx.run }, args, ctx.callId);
+  return { ok: !text.startsWith('ERROR'), output: text };
+}
+
+async function readArtifact(args: Record<string, unknown>, ctx: ToolCtx): Promise<ToolResult> {
+  const text = await ctx.orchestrator.readArtifact(args);
+  return { ok: !text.startsWith('ERROR'), output: text };
 }
 
 async function askUser(args: Record<string, unknown>, ctx: ToolCtx): Promise<ToolResult> {

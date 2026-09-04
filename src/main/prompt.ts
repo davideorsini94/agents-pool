@@ -1,12 +1,16 @@
-// Prompt sources for both prompt generations:
-//  - v1 `buildSystemPrompt` — pure function, rebuilt from live config at every iteration
-//    (PLAN §5.5, §10); its prompts are English by design, the model answers in the user's language.
-//  - v2 `DEFAULT_PROMPTS` / fixed rule blocks — the Italian role prompts of PLAN-v2 §9, verbatim.
-//    Step 0 only adds the constants + `defaultPrompt(role)` so both workstreams reference the same
-//    text; TODO(v2-A): replace `buildSystemPrompt` with `buildRolePrompt` + the instance message
-//    builders (`buildContractMessage`, `buildPlannerMessage`, `buildVerifierMessage`), PLAN-v2 §1/§9.
+// Prompt sources (PLAN-v2 §9). Italian role prompts, transcribed verbatim, plus the builders:
+//   - `buildRolePrompt`  — the SYSTEM prompt. Byte-identical between calls of one configuration:
+//     no date, no per-request data. The orchestrator's Pool / Limiti / Ambiente / Indicazioni
+//     sections change only when the user edits the configuration (§0 "Byte-identical system
+//     prompts"); instances get role prompt + fixed rules and nothing else.
+//   - `buildContractMessage` / `buildPlannerMessage` / `buildVerifierMessage` — the single USER
+//     message of an instance, where every dynamic value (date, contract, inlined inputs) lives.
+// IMPORTANT: no 'electron' import — the pool is exercised headless by scripts/api-smoke.mjs.
 
-import type { AgentConfig, AgentRole, AgentView, AppConfig } from '../shared/types';
+import type {
+  AgentConfig, AgentRole, AgentView, AppConfig, Budget, ResultContract, TaskContract,
+} from '../shared/types';
+import { DEFAULT_BUDGET, effectiveBudget, poolLimits, roleOf } from './contracts';
 
 export interface PromptEnv {
   platform: string;
@@ -16,63 +20,13 @@ export interface PromptEnv {
   locale: string;
 }
 
-export function buildSystemPrompt(
-  agent: AgentConfig,
-  cfg: AppConfig,
-  roster: AgentView[],
-  env: PromptEnv,
-): string {
-  const n = roster.length;
-  const isMain = agent.id === cfg.mainAgentId;
-  const lines: string[] = [];
-
-  lines.push(`You are "${agent.name}", an AI agent in a team of ${n} agent${n === 1 ? '' : 's'} inside the desktop app "Agents Pool".`);
-  lines.push('');
-  if (isMain) {
-    lines.push('You are the MAIN agent, the only one who talks to the user. Every user message arrives to you. Your final message without tool calls is shown to the user as the team\'s result — always end with a complete final answer. Delegate sub-tasks with delegate_task when a teammate\'s role fits, then integrate the results yourself.');
-  } else {
-    lines.push('You are a SPECIALIST agent. Tasks reach you by delegation from a teammate; your final message without tool calls is returned verbatim to that teammate (not to the user). Be complete, factual and concise. Never address the user directly except through ask_user when truly blocked.');
-  }
-
-  lines.push('', '## Your role', agent.prompt.trim() || '(no specific role given)');
-
-  lines.push('', `## Team (${n})`);
-  for (const a of roster) {
-    const tags: string[] = [];
-    if (a.isMain) tags.push('(MAIN)');
-    if (a.id === agent.id) tags.push('(you)');
-    const desc = a.description || 'no description';
-    lines.push(`- ${a.name} — ${desc} [model ${a.model}]${tags.length ? ' ' + tags.join(' ') : ''}`);
-  }
-
-  lines.push('', '## Interaction protocol (written by the user, follow it)');
-  lines.push(cfg.interactionPrompt.trim()
-    || 'No specific protocol. Delegate when a teammate\'s role fits the sub-task, otherwise do the work yourself.');
-  lines.push('Control always returns to the main agent, which produces the final output for the user.');
-
-  lines.push('', '## Environment');
-  lines.push(`OS ${env.platform} ${env.release} (${env.arch}) · shell ${env.shell} · workspace ${cfg.workspacePath ?? '(not set)'} (relative paths resolve here; prefer them) · date ${new Date().toISOString()} · user language: ${env.locale}`);
-
-  lines.push('', '## Rules');
-  lines.push('1. Act only through tools; never claim to have done something you did not do. Read before editing. Prefer edit_file for small changes.');
-  lines.push('2. run_command: non-interactive only (no prompts/editors); default cwd is the workspace; long-running servers: start with `&` redirecting to a log file, then inspect the log. Avoid sudo unless essential.');
-  lines.push('3. Some actions require the user\'s authorization (shown to them by the app, not by you). A denial is final for that action: explain it and propose alternatives.');
-  lines.push(`4. delegate_task: never yourself or an agent above you in the delegation chain; max depth ${cfg.maxDelegationDepth}. Give a self-contained task and context. Multiple independent delegations in one message run in parallel.`);
-  lines.push('5. The user watches your reasoning and tool activity live in a console; keep reasoning purposeful.');
-  lines.push(`6. Answer in the user's language (${env.locale}); code, commands and file contents keep their natural language.`);
-
-  return lines.join('\n');
-}
-
-// ---------------------------------------------------------------------------------------------
-// v2 role prompts (PLAN-v2 §9) — Italian, transcribed verbatim. The first line of each keeps the
-// v1 `descrizione:` convention (it becomes the console subtitle, config.ts::deriveDescription).
-// System prompt = template.prompt.trim() + '\n\n' + the fixed block of the role (below); the
-// orchestrator's Pool / Limiti / Ambiente / Indicazioni sections are the only dynamic parts and
-// change only on a config edit (§0 "Byte-identical system prompts").
-// Placeholders left for buildRolePrompt — TODO(v2-A): {locale}, {toolList}, {worker names},
-// {maxParallelWorkers}, {maxDepth}.
-// ---------------------------------------------------------------------------------------------
+/** UI/prompt label of a role (Italian, user-visible). */
+export const ROLE_LABEL: Record<AgentRole, string> = {
+  orchestrator: 'orchestratore',
+  planner: 'planner',
+  worker: 'worker',
+  verifier: 'verificatore',
+};
 
 export const DEFAULT_PROMPTS: Record<AgentRole, string> = {
   orchestrator: `descrizione: coordina il pool di agenti e parla con l'utente
@@ -103,8 +57,7 @@ Sei il VERIFICATORE, avversariale: non migliori il lavoro, trovi ciò che non va
 Rispondi SOLO con JSON: {"findings":[{"severity":"blocker|major|minor","task_id":"t2","issue":"…","fix":"…"}],"verdict":"blocker|no_blocker","summary":"una riga"}. Se non ci sono blocker, dillo in una riga in summary.`,
 };
 
-/** Fixed rules appended to the orchestrator's system prompt (PLAN-v2 §9), followed by the
- *  config-driven sections of ORCHESTRATOR_SECTIONS. */
+/** Fixed rules appended to the orchestrator's system prompt (PLAN-v2 §9). */
 export const FIXED_RULES_ORCHESTRATOR = `## Regole fisse
 - Agisci solo tramite strumenti; non affermare mai di aver fatto ciò che non hai fatto. Un rifiuto di autorizzazione da parte dell'utente è definitivo.
 - Il tuo messaggio finale senza chiamate a strumenti è la risposta mostrata all'utente: inizia con il livello (es. "T2 ·") e chiudi sempre con una risposta completa.
@@ -112,8 +65,7 @@ export const FIXED_RULES_ORCHESTRATOR = `## Regole fisse
 - I worker non vedono questa conversazione: ogni contratto deve bastare da solo.
 - Rispondi nella lingua dell'utente ({locale}); codice, comandi e contenuti dei file restano nella loro lingua.`;
 
-/** Headers and fixed wordings of the orchestrator's config-driven sections (PLAN-v2 §9).
- *  TODO(v2-A): filled by buildRolePrompt from the live AppConfig + roster. */
+/** Headers and fixed wordings of the orchestrator's config-driven sections (PLAN-v2 §9). */
 export const ORCHESTRATOR_SECTIONS = {
   pool: '## Pool',
   limits: '## Limiti',
@@ -125,21 +77,218 @@ export const ORCHESTRATOR_SECTIONS = {
   noUserNotes: '(nessuna)',
 } as const;
 
-/** Fixed rules appended to an instance's system prompt — worker / planner / verifier share the
- *  block, but two lines are conditional (`runCommand`: worker only; `delegateTasks`: worker only
- *  while the tool is exposed, i.e. cfg.allowWorkerDelegation), so it is exposed line by line
- *  instead of as one string (PLAN-v2 §9). Order: header, tools, [runCommand], [delegateTasks],
- *  jsonOnly, language. */
+/** Fixed rules appended to an instance's system prompt (PLAN-v2 §9). */
 export const INSTANCE_RULES = {
   header: '## Regole fisse',
   tools: '- Agisci solo tramite gli strumenti disponibili ({toolList}); i percorsi relativi partono dal workspace indicato nel messaggio.',
   runCommand: '- run_command: solo comandi non interattivi. Alcune azioni richiedono l\'autorizzazione dell\'utente, gestita dall\'app: un rifiuto è definitivo, riportalo in unverified.',
   delegateTasks: '- delegate_tasks: puoi delegare sotto-task disgiunti a un template worker della sezione Pool ({worker names}); mai a te stesso né a chi ti ha delegato; al massimo {maxParallelWorkers} per chiamata, profondità massima {maxDepth}.',
   jsonOnly: '- Il tuo ultimo messaggio deve contenere solo il JSON richiesto, senza testo attorno. Il campo cost lo compila il sistema.',
+  // Replaces `runCommand` when the user chose the bypass mode: saying "some actions need approval"
+  // would be false there, and the agent must know its actions execute immediately.
+  bypass: "- Modalità bypass attiva: l'app non chiede alcuna autorizzazione, quindi ogni azione (compresi comandi distruttivi o percorsi fuori dal workspace) viene eseguita subito e senza conferma. Agisci con prudenza: preferisci azioni minime e reversibili, resta nel workspace se non è indispensabile uscirne, e non eseguire comandi che non ti servono per l'obiettivo del contratto.",
   language: '- Rispondi nella lingua della richiesta ({locale}); codice, comandi e contenuti dei file restano nella loro lingua.',
 } as const;
 
 /** `config:defaultPrompt` (PLAN-v2 §3): the Italian default prompt text of a role. */
 export function defaultPrompt(role: AgentRole): string {
-  return DEFAULT_PROMPTS[role];
+  return DEFAULT_PROMPTS[role] ?? DEFAULT_PROMPTS.worker;
+}
+
+// ================================================================ system prompts
+
+export interface RolePromptOpts {
+  /** Tool names exposed to this role in this iteration (tools.ts::toolNamesFor). */
+  toolNames: string[];
+}
+
+/**
+ * SYSTEM prompt of a template (PLAN-v2 §9). Contains zero per-request data: the orchestrator's
+ * dynamic sections derive from the configuration only, instances get no dynamic data at all.
+ */
+export function buildRolePrompt(
+  agent: AgentConfig,
+  cfg: AppConfig,
+  roster: AgentView[],
+  env: PromptEnv,
+  opts: RolePromptOpts,
+): string {
+  const role = roleOf(agent);
+  const head = (agent.prompt ?? '').trim() || DEFAULT_PROMPTS[role];
+  if (role === 'orchestrator') {
+    return [
+      head,
+      '',
+      FIXED_RULES_ORCHESTRATOR.replace('{locale}', env.locale),
+      poolSection(roster),
+      limitsSection(cfg),
+      environmentSection(cfg, env),
+      notesSection(cfg),
+    ].join('\n');
+  }
+  return [head, '', instanceRules(role, cfg, roster, env, opts.toolNames)].join('\n');
+}
+
+function poolSection(roster: AgentView[]): string {
+  const lines: string[] = [ORCHESTRATOR_SECTIONS.pool];
+  for (const a of roster) {
+    if (roleOf(a) === 'orchestrator') continue;
+    const routing: string[] = [`modello ${a.model}`];
+    if (a.fallbacks && a.fallbacks.length) routing.push(`fallback ${a.fallbacks.join(', ')}`);
+    if (a.escalation) routing.push(`escalation ${a.escalation}`);
+    lines.push(`- ${a.name} — ${ROLE_LABEL[roleOf(a)]} — ${a.description || 'senza descrizione'} [${routing.join(', ')}]`);
+  }
+  if (!roster.some((a) => roleOf(a) === 'planner')) lines.push(`- ${ORCHESTRATOR_SECTIONS.noPlanner}`);
+  if (!roster.some((a) => roleOf(a) === 'verifier')) lines.push(`- ${ORCHESTRATOR_SECTIONS.noVerifier}`);
+  if (!roster.some((a) => roleOf(a) === 'worker')) lines.push(`- ${ORCHESTRATOR_SECTIONS.noWorker}`);
+  return lines.join('\n');
+}
+
+function limitsSection(cfg: AppConfig): string {
+  const l = poolLimits(cfg);
+  const depth = l.allowWorkerDelegation ? `${l.maxDepth} (i worker possono delegare)` : '2';
+  const b = DEFAULT_BUDGET;
+  return [
+    ORCHESTRATOR_SECTIONS.limits,
+    `worker paralleli per chiamata: ${l.maxParallelWorkers} · istanze per richiesta: ${l.maxWorkersPerRequest}`
+    + ` · round di correzione: ${l.correctionRounds} · profondità: ${depth}`
+    + ` · soglia artefatti: ${l.artifactThresholdChars} caratteri`
+    + ` · budget predefinito per task: ${b.maxTokens}/${b.maxToolCalls}/${b.maxSeconds}`,
+  ].join('\n');
+}
+
+function environmentSection(cfg: AppConfig, env: PromptEnv): string {
+  return [
+    ORCHESTRATOR_SECTIONS.environment,
+    `OS ${env.platform} ${env.release} (${env.arch}) · shell ${env.shell} · workspace ${cfg.workspacePath ?? '(non impostato)'} (i percorsi relativi partono da qui)`,
+  ].join('\n');
+}
+
+function notesSection(cfg: AppConfig): string {
+  return [
+    ORCHESTRATOR_SECTIONS.userNotes,
+    (cfg.interactionPrompt ?? '').trim() || ORCHESTRATOR_SECTIONS.noUserNotes,
+  ].join('\n');
+}
+
+function instanceRules(
+  role: AgentRole,
+  cfg: AppConfig,
+  roster: AgentView[],
+  env: PromptEnv,
+  toolNames: string[],
+): string {
+  const l = poolLimits(cfg);
+  const lines: string[] = [INSTANCE_RULES.header];
+  lines.push(INSTANCE_RULES.tools.replace('{toolList}', toolNames.join(', ') || 'nessuno'));
+  const bypass = cfg.permissionMode === 'bypass';
+  if (role === 'worker' && toolNames.includes('run_command')) {
+    lines.push(bypass ? INSTANCE_RULES.bypass : INSTANCE_RULES.runCommand);
+  } else if (bypass && role === 'worker') {
+    lines.push(INSTANCE_RULES.bypass);
+  }
+  if (role === 'worker' && toolNames.includes('delegate_tasks')) {
+    const workers = roster.filter((a) => roleOf(a) === 'worker').map((a) => a.name).join(', ');
+    lines.push(INSTANCE_RULES.delegateTasks
+      .replace('{worker names}', workers || '—')
+      .replace('{maxParallelWorkers}', String(l.maxParallelWorkers))
+      .replace('{maxDepth}', String(l.maxDepth)));
+  }
+  lines.push(INSTANCE_RULES.jsonOnly);
+  lines.push(INSTANCE_RULES.language.replace('{locale}', env.locale));
+  return lines.join('\n');
+}
+
+// ================================================================ instance user messages
+
+function ambiente(cfg: AppConfig, env: PromptEnv): string {
+  return [
+    '## Ambiente',
+    `OS ${env.platform} ${env.release} (${env.arch}) · shell ${env.shell} · workspace ${cfg.workspacePath ?? '(non impostato)'}`
+    + ` · data ${new Date().toISOString()} · lingua utente ${env.locale}`,
+  ].join('\n');
+}
+
+/** The contract as the worker sees it: inputs are listed by reference, contents come below. */
+function contractForModel(c: TaskContract, budget: Budget): Record<string, unknown> {
+  return {
+    task_id: c.task_id,
+    role: c.role,
+    objective: c.objective,
+    inputs: c.inputs.map((i) => (i.type === 'text'
+      ? { type: 'text', chars: i.content.length }
+      : (i.type === 'artifact_ref' ? { type: 'artifact_ref', id: i.id } : { type: 'file', path: i.path }))),
+    constraints: c.constraints,
+    deliverable: c.deliverable,
+    acceptance: c.acceptance,
+    side_effects: c.side_effects,
+    budget: { max_tokens: budget.maxTokens, max_tool_calls: budget.maxToolCalls, max_seconds: budget.maxSeconds },
+  };
+}
+
+export interface ContractMessageOpts {
+  contract: TaskContract;
+  /** Already-inlined input blocks from ArtifactStore.inline (§7.2). */
+  inputBlocks: string[];
+  budget: Budget;
+  attempt: number;
+  /** Result of the previous attempt, when this is a correction / blocked continuation (§9). */
+  previous?: ResultContract | null;
+}
+
+/** The single USER message of a worker instance (PLAN-v2 §9 "Instance user message"). */
+export function buildContractMessage(cfg: AppConfig, env: PromptEnv, o: ContractMessageOpts): string {
+  const parts: string[] = [ambiente(cfg, env)];
+  parts.push('', '## TaskContract', '```json', JSON.stringify(contractForModel(o.contract, o.budget), null, 2), '```');
+  if (o.inputBlocks.length) parts.push('', '## Input inclusi', o.inputBlocks.join('\n\n'));
+  if (o.attempt > 1) {
+    const prev = o.previous;
+    const summary = prev
+      ? `stato precedente: ${prev.status}\n${typeof prev.result === 'string' ? prev.result.slice(0, 1200) : `artifact_ref ${prev.result.artifact_ref} — ${prev.result.summary}`}`
+      : '(esito precedente non disponibile)';
+    parts.push('', `## Tentativo ${o.attempt}`, summary);
+  }
+  parts.push('', '## Risposta attesa', `Solo il ResultContract JSON con task_id "${o.contract.task_id}".`);
+  return parts.join('\n');
+}
+
+/** The single USER message of a planner instance (PLAN-v2 §9). */
+export function buildPlannerMessage(
+  cfg: AppConfig,
+  env: PromptEnv,
+  o: { objective: string; context?: string; workers: AgentView[] },
+): string {
+  const parts: string[] = [ambiente(cfg, env)];
+  parts.push('', '## Obiettivo', o.objective.trim());
+  parts.push('', '## Contesto', (o.context ?? '').trim() || '(nessuno)');
+  parts.push('', '## Template worker disponibili');
+  if (o.workers.length) {
+    for (const w of o.workers) parts.push(`- ${w.name} — ${w.description || 'senza descrizione'}`);
+  } else {
+    parts.push('- (nessuno: indica comunque i task, il sistema li assegnerà)');
+  }
+  parts.push('', '## Risposta attesa',
+    'Solo JSON: {"tasks":[{"task_id":"t1","role":"…","objective":"…","inputs":[],"constraints":[],"deliverable":"…","acceptance":"…","side_effects":false,"depends_on":[]}],"assumptions":["…"],"if_false":["…"]}',
+    'Al massimo 6 task.');
+  return parts.join('\n');
+}
+
+export interface VerifierItem { taskId: string; contract: TaskContract; output: string }
+
+/** The single USER message of a verifier instance (PLAN-v2 §9). */
+export function buildVerifierMessage(
+  cfg: AppConfig,
+  env: PromptEnv,
+  o: { userText: string; items: VerifierItem[] },
+): string {
+  const parts: string[] = [ambiente(cfg, env)];
+  parts.push('', "## Richiesta originale dell'utente", o.userText.trim() || '(non disponibile)');
+  for (const it of o.items) {
+    const budget = effectiveBudget(it.contract.budget, undefined);
+    parts.push('', `## ${it.taskId} — TaskContract`, '```json', JSON.stringify(contractForModel(it.contract, budget), null, 2), '```');
+    parts.push('', `## ${it.taskId} — Output`, it.output);
+  }
+  parts.push('', '## Risposta attesa',
+    'Solo JSON: {"findings":[{"severity":"blocker|major|minor","task_id":"t2","issue":"…","fix":"…"}],"verdict":"blocker|no_blocker","summary":"una riga"}');
+  return parts.join('\n');
 }

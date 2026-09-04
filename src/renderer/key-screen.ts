@@ -33,9 +33,15 @@ export class KeyScreen {
     this.probeModel = info.probeModel;
     this.input = h('input', {
       class: 'input key', type: 'password', placeholder: 'sk-…', spellcheck: false,
+      title: 'Incolla qui la API key di OpenCode Go (inizia con "sk-"). Viene inviata a opencode.ai solo per '
+        + 'la verifica e poi salvata su questo computer, cifrata quando il sistema lo consente. Invio per validare.',
       aria: { label: 'API key di OpenCode Go' },
     });
-    const eye = h('button', { class: 'icon-btn reveal', type: 'button', title: 'Mostra/nascondi la chiave' }, '👁');
+    const eye = h('button', {
+      class: 'icon-btn reveal', type: 'button',
+      title: 'Mostra o nasconde i caratteri della chiave: utile per controllare un incollaggio, evitalo se qualcuno guarda lo schermo.',
+      aria: { label: 'Mostra o nascondi la chiave' },
+    }, '👁');
     eye.addEventListener('click', () => {
       const shown = this.input.getAttribute('type') === 'text';
       this.input.setAttribute('type', shown ? 'password' : 'text');
@@ -53,8 +59,13 @@ export class KeyScreen {
 
     this.errBox = h('div', { class: 'err', hidden: true });
     this.spinner = h('span', { class: 'spinner', hidden: true });
-    this.primary = btn('Valida e continua', () => void this.validate(), 'btn primary wide');
-    this.secondary = btn('Importa da opencode CLI', () => void this.importKey(), 'btn ghost wide');
+    this.primary = btn('Valida e continua', () => void this.validate(), 'btn primary wide',
+      'Prova la chiave con una vera chiamata al modello di verifica'
+      + (this.probeModel ? ' (' + this.probeModel + ')' : '')
+      + ': se risponde, la chiave viene salvata e si passa alla configurazione del pool.');
+    this.secondary = btn('Importa da opencode CLI', () => void this.importKey(), 'btn ghost wide',
+      'Riprende la chiave già salvata dalla CLI opencode su questo computer (~/.local/share/opencode/auth.json) '
+      + 'e la valida: non serve incollarla a mano.');
 
     this.root = h('div', { class: 'screen center' },
       h('div', { class: 'card key-card' },

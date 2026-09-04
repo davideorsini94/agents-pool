@@ -29,6 +29,9 @@ class App {
   private subscribe(): void {
     window.api.on('console:event', (ev) => this.workbench?.onConsoleEvent(ev));
     window.api.on('console:patch', (p) => this.workbench?.onConsolePatch(p));
+    // Ephemeral worker instances: `console:add` always precedes their first event (§3).
+    window.api.on('console:add', (v) => this.workbench?.onConsoleAdd(v));
+    window.api.on('console:remove', (r) => this.workbench?.onConsoleRemove(r));
     window.api.on('agent:status', (u) => this.workbench?.onAgentStatus(u));
     window.api.on('run:finished', (r) => this.workbench?.onRunFinished(r));
     window.api.on('config:changed', (c) => {
@@ -46,7 +49,7 @@ class App {
     window.api.on('permission:resolved', (r) => modals.drop('permission', r.requestId));
     window.api.on('askUser:request', (req) => modals.ask(req));
     window.api.on('askUser:resolved', (r) => modals.drop('ask', r.requestId));
-    window.api.on('app:toast', (t) => toast(t.level, t.message));
+    window.api.on('app:toast', (t) => toast(t.level, t.message, t.url));
   }
 
   // ------------------------------------------------------------------ routing
@@ -100,7 +103,8 @@ class App {
         h('div', { class: 'card' },
           h('div', { class: 'brand sm' }, 'Agents ', h('span', { class: 'accent', text: 'Pool' })),
           h('div', { class: 'err' }, h('strong', { text: 'Avvio non riuscito' }), h('span', { class: 'detail', text: message })),
-          btn('Riprova', () => void this.route(), 'btn primary wide'))));
+          btn('Riprova', () => void this.route(), 'btn primary wide',
+            'Ricarica configurazione e stato dal processo principale: utile se l’errore era temporaneo. Nessun dato viene perso.'))));
   }
 }
 

@@ -106,6 +106,63 @@ export function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
+/** Numeric clamp with a NaN-safe floor (shared by config/contracts/pool). */
+export function clampNum(n: unknown, lo: number, hi: number, dflt = lo): number {
+  const v = typeof n === 'number' ? n : (typeof n === 'string' ? Number.parseFloat(n) : NaN);
+  if (!Number.isFinite(v)) return dflt;
+  return Math.min(hi, Math.max(lo, v));
+}
+export function clampInt(n: unknown, lo: number, hi: number, dflt = lo): number {
+  return Math.round(clampNum(typeof n === 'number' ? n : Number.parseFloat(String(n)), lo, hi, dflt));
+}
+
+/**
+ * Comparison key for "is this the same task?" checks (PLAN-v2 §1, §6.3 step 2):
+ * lowercase, diacritics stripped, punctuation collapsed to a single space, trimmed.
+ */
+export function normalizeKey(s: unknown): string {
+  return String(s ?? '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * First balanced `{…}` object in a string (tolerates prose around the JSON and quoted braces).
+ * Lives here — not in agent.ts — so contracts.ts can reuse it without importing the agent loop
+ * (PLAN-v2 §7.3 says "reuse agent.ts firstBalancedObject, exported"; agent.ts re-exports it).
+ */
+export function firstBalancedObject(s: string): string | null {
+  const start = s.indexOf('{');
+  if (start < 0) return null;
+  let depth = 0;
+  let quote: string | null = null;
+  for (let i = start; i < s.length; i++) {
+    const ch = s[i];
+    if (quote) {
+      if (ch === '\\') { i++; continue; }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") { quote = ch; continue; }
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) return s.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
+/** Strips a leading ```json fence (and the closing one) when the whole text is fenced. */
+export function stripFences(s: string): string {
+  const m = /^\s*```(?:json|JSON)?\s*\n([\s\S]*?)\n?\s*```\s*$/.exec(s);
+  return m ? m[1] : s;
+}
+
 export function fmtErr(e: unknown): string {
   if (e instanceof Error) return e.message || e.name;
   if (typeof e === 'string') return e;
@@ -141,6 +198,61 @@ export function linkSignal(outer: AbortSignal | undefined): { controller: AbortC
   const onAbort = () => controller.abort();
   outer.addEventListener('abort', onAbort, { once: true });
   return { controller, dispose: () => outer.removeEventListener('abort', onAbort) };
+}
+
+/**
+ * Counting semaphore whose capacity is a *function*, re-read at every acquire so a lowered
+ * `maxParallelWorkers` applies to the next spawn while running instances finish (PLAN-v2 §12).
+ * `release()` wakes every waiter; each re-checks the (possibly changed) capacity.
+ */
+export class Semaphore {
+  private active = 0;
+  private waiters: Array<() => void> = [];
+
+  constructor(private readonly capacity: () => number) {}
+
+  get inUse(): number { return this.active; }
+
+  async acquire(): Promise<() => void> {
+    for (;;) {
+      if (this.active < Math.max(1, Math.round(this.capacity()))) { this.active += 1; break; }
+      await new Promise<void>((resolve) => { this.waiters.push(resolve); });
+    }
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.active -= 1;
+      const woken = this.waiters.splice(0);
+      for (const w of woken) w();
+    };
+  }
+
+  /** Convenience wrapper; always releases. */
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    const release = await this.acquire();
+    try { return await fn(); } finally { release(); }
+  }
+}
+
+/** FIFO mutual exclusion — used to serialize side-effect instances (PLAN-v2 §6.3 step 6). */
+export class Mutex {
+  private tail: Promise<void> = Promise.resolve();
+
+  async acquire(): Promise<() => void> {
+    let release: () => void = () => {};
+    const next = new Promise<void>((resolve) => { release = resolve; });
+    const prev = this.tail;
+    this.tail = prev.then(() => next);
+    await prev;
+    let done = false;
+    return () => { if (!done) { done = true; release(); } };
+  }
+
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    const release = await this.acquire();
+    try { return await fn(); } finally { release(); }
+  }
 }
 
 /** Trailing debounce with a hard "at most once per maxIntervalMs" cap. */
@@ -221,6 +333,18 @@ export function readJsonSync<T>(file: string): T | null {
   } catch {
     return null;
   }
+}
+
+const APPEND_MAX_BYTES = 20 * 1024 * 1024;
+
+/** Appends one line to a log file, rotating to `<file>.1` past 20 MB (PLAN-v2 §7.7). */
+export async function appendLine(file: string, text: string): Promise<void> {
+  await fsp.mkdir(path.dirname(file), { recursive: true });
+  try {
+    const st = await fsp.stat(file);
+    if (st.size > APPEND_MAX_BYTES) await fsp.rename(file, `${file}.1`);
+  } catch { /* no file yet */ }
+  await fsp.appendFile(file, text.endsWith('\n') ? text : `${text}\n`, 'utf8');
 }
 
 export async function readJson<T>(file: string): Promise<T | null> {

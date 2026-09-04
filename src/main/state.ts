@@ -26,9 +26,14 @@ interface AgentEntry {
   usage: Usage;
   events: ConsoleEvent[];
   seq: number;
+  /** Worker-instance consoles (`<templateId>#<path>`): memory only, never a file (PLAN-v2 §15). */
+  ephemeral: boolean;
   historyWriter: DebouncedWriter;
   consoleWriter: DebouncedWriter;
 }
+
+/** `#` marks an instance console id; such ids must never reach a file name (PLAN-v2 §0, §15). */
+export function isEphemeralId(id: AgentId): boolean { return id.includes('#'); }
 
 export class StateStore {
   private readonly dir: string;
@@ -44,8 +49,9 @@ export class StateStore {
   /** Loads (or creates) the persisted state for an agent. Idempotent. */
   ensure(id: AgentId): void {
     if (this.agents.has(id)) return;
-    const st = readJsonSync<unknown>(this.agentFile(id));
-    const cs = readJsonSync<unknown>(this.consoleFile(id));
+    const ephemeral = isEphemeralId(id);
+    const st = ephemeral ? null : readJsonSync<unknown>(this.agentFile(id));
+    const cs = ephemeral ? null : readJsonSync<unknown>(this.consoleFile(id));
     const entry: AgentEntry = {
       id,
       sessionId: isRecord(st) && typeof st.sessionId === 'string' && st.sessionId ? st.sessionId : uuid(),
@@ -53,11 +59,25 @@ export class StateStore {
       usage: isRecord(st) && isRecord(st.usage) ? sanitizeUsage(st.usage) : emptyUsage(),
       events: isRecord(cs) && Array.isArray(cs.events) ? sanitizeEvents(cs.events) : [],
       seq: 0,
+      ephemeral,
       historyWriter: new DebouncedWriter(500, 5000, () => this.writeHistory(id)),
       consoleWriter: new DebouncedWriter(1000, 5000, () => this.writeConsole(id)),
     };
     entry.seq = entry.events.length ? entry.events[entry.events.length - 1].seq : 0;
     this.agents.set(id, entry);
+  }
+
+  has(id: AgentId): boolean { return this.agents.has(id); }
+
+  /** Forgets an ephemeral console (instance:close / next request / template removed, §6.5).
+   *  Never touches the filesystem: these entries were never on disk. */
+  drop(id: AgentId): void {
+    const e = this.agents.get(id);
+    if (!e) return;
+    e.historyWriter.dispose();
+    e.consoleWriter.dispose();
+    this.agents.delete(id);
+    if (!e.ephemeral) logWarn(`state: drop() called on a persistent entry ${id} — files kept`);
   }
 
   private entry(id: AgentId): AgentEntry {
@@ -100,6 +120,7 @@ export class StateStore {
   /** Drops every trace of an agent (config removal). */
   removeAgent(id: AgentId): void {
     const e = this.agents.get(id);
+    if (e && e.ephemeral) { this.drop(id); return; }
     if (e) {
       e.historyWriter.dispose();
       e.consoleWriter.dispose();
@@ -145,7 +166,7 @@ export class StateStore {
 
   private async writeHistory(id: AgentId): Promise<void> {
     const e = this.agents.get(id);
-    if (!e) return;
+    if (!e || e.ephemeral) return;
     const data: AgentState = {
       sessionId: e.sessionId,
       history: e.history,
@@ -208,7 +229,7 @@ export class StateStore {
 
   private async writeConsole(id: AgentId): Promise<void> {
     const e = this.agents.get(id);
-    if (!e) return;
+    if (!e || e.ephemeral) return;
     await atomicWrite(this.consoleFile(id), JSON.stringify({ events: e.events }));
   }
 
@@ -217,6 +238,7 @@ export class StateStore {
   async flushAll(): Promise<void> {
     const tasks: Promise<void>[] = [];
     for (const e of this.agents.values()) {
+      if (e.ephemeral) continue;              // instance consoles are dropped, never flushed
       tasks.push(e.historyWriter.flush());
       tasks.push(e.consoleWriter.flush());
     }

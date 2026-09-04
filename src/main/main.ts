@@ -6,11 +6,17 @@ import * as path from 'node:path';
 import { BrowserWindow, app, protocol, session } from 'electron';
 import type { AppInfo } from '../shared/types';
 import { OpenCodeClient } from './api';
-import { ConfigStore, DEFAULT_MODEL, PALETTE, PROBE_MODEL } from './config';
+import { ArtifactStore } from './artifacts';
+import {
+  DEFAULT_BUDGET, DEFAULT_MODEL, ECONOMY_POOL, EMPTY_POOL, MODEL_TABLE, PALETTE, POOL_RANGES,
+  PROBE_MODEL, RECOMMENDED_POOL, ConfigStore,
+} from './config';
+import { ContractsLog } from './contracts';
 import { registerHandlers } from './ipc';
 import { Orchestrator } from './orchestrator';
 import { PermissionGate, registerProtectedPaths } from './permissions';
 import { PromptEnv } from './prompt';
+import { ModelRouter } from './router';
 import { ConsoleBus, StateStore } from './state';
 import { Send, fmtErr, initLog, log, logError, logWarn } from './util';
 
@@ -97,7 +103,14 @@ async function bootstrap(): Promise<void> {
 
   const state = new StateStore(userData);
   const bus = new ConsoleBus(state, send);
-  const client = new OpenCodeClient(() => config.getApiKey(), app.getVersion(), { cacheDir: userData });
+  // MODEL_TABLE is injected (never imported) so api.ts and router.ts stay electron-free (§1).
+  const client = new OpenCodeClient(() => config.getApiKey(), app.getVersion(), {
+    cacheDir: userData,
+    modelTable: MODEL_TABLE,
+  });
+  const router = new ModelRouter({ cfg: () => config.get(), send, modelTable: MODEL_TABLE });
+  const artifacts = new ArtifactStore(userData);
+  const contracts = new ContractsLog(userData);
 
   const gate = new PermissionGate({
     cfg: () => config.get(),
@@ -117,6 +130,7 @@ async function bootstrap(): Promise<void> {
 
   const orchestrator = new Orchestrator({
     config, state, bus, client, gate, send, env, appVersion: app.getVersion(),
+    router, artifacts, contracts,
   });
   orchestrator.start();
 
@@ -136,10 +150,15 @@ async function bootstrap(): Promise<void> {
     hasApiKey: config.hasApiKey(),
     setupComplete: config.get().setupComplete,
     locale: env.locale,
+    poolRanges: POOL_RANGES,
+    recommendedPool: RECOMMENDED_POOL,
+    economyPool: ECONOMY_POOL,
+    emptyPool: EMPTY_POOL,
+    defaultBudget: DEFAULT_BUDGET,
   });
 
   registerHandlers({
-    config, state, bus, client, gate, orchestrator, send,
+    config, state, bus, client, gate, orchestrator, send, contracts,
     appInfo,
     getWindow: () => win,
   });
@@ -158,7 +177,10 @@ async function bootstrap(): Promise<void> {
     log('quit: cancelling runs and flushing state');
     try { orchestrator.cancelAll('chiusura applicazione'); } catch (e) { logWarn('cancelAll on quit', e); }
     try { bus.flushAll(); } catch (e) { logWarn('bus flush on quit', e); }
-    const done = state.flushAll().catch((e) => logWarn('state flush on quit', e));
+    const done = Promise.all([
+      state.flushAll().catch((e) => logWarn('state flush on quit', e)),
+      contracts.flush(),
+    ]).then(() => undefined);
     const cap = new Promise<void>((r) => setTimeout(r, 2000));
     void Promise.race([done, cap]).then(() => app.exit(0));
   });

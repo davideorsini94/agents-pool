@@ -2,7 +2,7 @@
 // programmatically so the strict CSP (script-src 'self'; style-src 'self') is never violated.
 // Inline colours are applied through the CSSOM (element.style.setProperty), which CSP allows.
 
-import type { ModelInfo } from '../shared/types';
+import type { AgentRole, Budget, ModelInfo, ModelPrivacy, Usage } from '../shared/types';
 
 export type Child = Node | string | number | null | undefined | false | Child[];
 
@@ -92,7 +92,13 @@ export function frag(...children: Child[]): DocumentFragment {
 }
 
 export function clear(el: Node): void {
-  while (el.firstChild) el.removeChild(el.firstChild);
+  // Removing a focused node fires blur synchronously, and a blur handler may re-enter and
+  // detach further nodes: never assume `firstChild` is still ours (NotFoundError otherwise).
+  while (el.firstChild) {
+    const child: ChildNode = el.firstChild;
+    if (child.parentNode === el) el.removeChild(child);
+    else child.remove();
+  }
 }
 
 export function replace(el: Node, ...children: Child[]): void {
@@ -115,8 +121,40 @@ export function btn(
   label: string,
   onClick: () => void,
   cls = 'btn',
+  title?: string,
 ): HTMLButtonElement {
-  return h('button', { class: cls, type: 'button', on: { click: () => onClick() } }, label);
+  return h('button', { class: cls, type: 'button', title, on: { click: () => onClick() } }, label);
+}
+
+/**
+ * Native tooltip on an element, inline inside an `h(...)` tree: `tip(sel, 'che cosa fa')`.
+ * Deliberately the only tooltip mechanism in the app — no custom layer, no library.
+ */
+export function tip<T extends HTMLElement>(el: T, title: string): T {
+  el.title = title;
+  return el;
+}
+
+/**
+ * `<label class="field">` used by the wizard and the settings drawer. The help text lands on
+ * the wrapper *and* on every control inside that has none yet, so hovering the label, the hint
+ * or the input all show the same explanation (icon buttons keep their own, more specific one).
+ */
+export function field(
+  label: string,
+  title: string,
+  opts: { cls?: string; hint?: string } | null,
+  ...controls: Child[]
+): HTMLLabelElement {
+  const el = h('label', { class: opts?.cls ?? 'field', title },
+    h('span', { class: 'lbl', text: label }),
+    ...controls,
+    opts?.hint ? h('span', { class: 'hint', text: opts.hint }) : null);
+  for (const c of Array.from(el.querySelectorAll('input,select,textarea,button'))) {
+    const ctrl = c as HTMLElement;
+    if (!ctrl.title) ctrl.title = title;
+  }
+  return el;
 }
 
 // ---------------------------------------------------------------- formatters
@@ -171,8 +209,126 @@ export function modelLabel(m: ModelInfo): string {
     parts.push(i + '/' + o + ' per M');
   }
   if (typeof m.contextLimit === 'number' && m.contextLimit > 0) parts.push(fmtTokens(m.contextLimit) + ' ctx');
+  if (typeof m.reqPer5h === 'number' && m.reqPer5h > 0) parts.push(m.reqPer5h.toLocaleString('it-IT') + ' req/5h');
   if (m.reasoning) parts.push('ragionamento');
+  if (m.unavailable) parts.push('non disponibile in questa sessione');
   return parts.join(' · ');
+}
+
+// ------------------------------------------------------- roles / model badges
+
+export const ROLE_LABEL: Record<AgentRole, string> = {
+  orchestrator: 'Orchestratore',
+  planner: 'Planner',
+  worker: 'Worker',
+  verifier: 'Verificatore',
+};
+
+export const ROLE_ORDER: AgentRole[] = ['orchestrator', 'planner', 'worker', 'verifier'];
+
+/**
+ * Role of a template / instance view. `role` is optional in the contract until Workstream A
+ * fills it in (types.d.ts TODO(v2-A)), so v1 configs degrade to main ⇒ orchestrator, else worker.
+ */
+export function roleOf(a: { role?: AgentRole; isMain?: boolean }): AgentRole {
+  return a.role ?? (a.isMain ? 'orchestrator' : 'worker');
+}
+
+interface BadgeSpec { text: string; cls: string; title: string }
+
+const PRIVACY_BADGE: Record<ModelPrivacy, BadgeSpec> = {
+  zdr: { text: 'ZDR', cls: 'ok', title: 'Zero Data Retention: prompt e risposte non vengono conservati.' },
+  zdr_verify: {
+    text: 'ZDR fino al 31/08/2026 · conferma rinnovo',
+    cls: 'warn',
+    title: 'L’accordo Zero Data Retention risulta valido fino al 31/08/2026: verifica il rinnovo prima di inviare dati sensibili.',
+  },
+  retention_30d: { text: 'conservazione 30 gg', cls: 'warn', title: 'Il fornitore conserva prompt e risposte per 30 giorni.' },
+  training: {
+    text: 'addestramento dati',
+    cls: 'bad',
+    title: 'Prompt e risposte vengono usati per addestrare modelli di terze parti: non usarlo con contenuti proprietari o clinici.',
+  },
+};
+
+export function privacyBadge(m: ModelInfo | undefined | null): HTMLElement | null {
+  if (!m) return null;
+  const spec = PRIVACY_BADGE[m.privacy ?? 'zdr'];
+  return h('span', { class: 'badge priv ' + spec.cls, title: spec.title, text: spec.text });
+}
+
+/** `responses` models talk to a different API surface — worth showing, never blocking. */
+export function formatBadge(m: ModelInfo | undefined | null): HTMLElement | null {
+  if (!m || (m.format ?? 'chat') !== 'responses') return null;
+  return h('span', { class: 'badge fmt', title: 'Usa l’API /responses di OpenCode Go.', text: 'responses' });
+}
+
+/** Lenient-JSON models are fine as orchestrator (tool driven), risky as JSON workers. */
+export function jsonBadge(m: ModelInfo | undefined | null, role?: AgentRole): HTMLElement | null {
+  if (!m || m.jsonStrict !== false || role === 'orchestrator') return null;
+  return h('span', {
+    class: 'badge priv warn', text: 'JSON non stretto',
+    title: 'Questo modello avvolge il JSON in prosa: il ResultContract viene estratto dal testo (funziona, ma è meno affidabile).',
+  });
+}
+
+/** Token-hungry models produce nothing under a small budget → amber chip. */
+export function notesBadge(m: ModelInfo | undefined | null): HTMLElement | null {
+  if (!m) return null;
+  const notes = m.notes ?? '';
+  const hungry = /token-hungry|molti token|nulla sotto/i.test(notes) || /^mimo-/.test(m.id);
+  if (!hungry) return null;
+  return h('span', {
+    class: 'badge priv warn', text: 'molti token',
+    title: notes || 'Consuma molti token di ragionamento: con budget piccoli può non produrre nulla.',
+  });
+}
+
+/** Every badge the routing editor shows for one model, in a stable order. */
+export function modelBadges(m: ModelInfo | undefined | null, role?: AgentRole): HTMLElement[] {
+  if (!m) return [];
+  const out: Array<HTMLElement | null> = [privacyBadge(m), formatBadge(m), jsonBadge(m, role), notesBadge(m)];
+  if (m.unavailable) {
+    out.push(h('span', {
+      class: 'badge priv dim', text: 'non disponibile',
+      title: m.notes ? 'Non disponibile in questa sessione · ' + m.notes : 'Non disponibile in questa sessione.',
+    }));
+  }
+  return out.filter((x): x is HTMLElement => x !== null);
+}
+
+/** `tok 3.1k/8k · strumenti 2/10 · 41 s/180 s` — u = live usage, b = budget, s = counters. */
+export function fmtBudget(
+  u: Usage | undefined,
+  b: Budget | undefined,
+  s: { toolCalls: number; elapsedMs: number },
+): string {
+  const tok = (u?.promptTokens ?? 0) + (u?.completionTokens ?? 0);
+  const secs = Math.max(0, Math.round(s.elapsedMs / 1000));
+  return [
+    'tok ' + fmtTokens(tok) + (b ? '/' + fmtTokens(b.maxTokens) : ''),
+    'strumenti ' + s.toolCalls + (b ? '/' + b.maxToolCalls : ''),
+    secs + ' s' + (b ? '/' + b.maxSeconds + ' s' : ''),
+  ].join(' · ');
+}
+
+/** `minimax-m3 → mimo-v2.5, qwen3.7-plus ↑ glm-5.3` (fallback chain, then escalation). */
+export function routingSummary(a: { model: string; fallbacks?: string[]; escalation?: string }): string {
+  let s = a.model || '—';
+  const fb = (a.fallbacks ?? []).filter(Boolean);
+  if (fb.length) s += ' → ' + fb.join(', ');
+  if (a.escalation) s += ' ↑ ' + a.escalation;
+  return s;
+}
+
+/** Pretty-print a contract / verdict object; never throws. */
+export function prettyJson(v: unknown): string {
+  if (typeof v === 'string') return v;
+  try {
+    return JSON.stringify(v, null, 2) ?? String(v);
+  } catch {
+    return String(v);
+  }
 }
 
 export function truncate(s: string, n: number): string {

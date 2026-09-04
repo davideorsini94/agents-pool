@@ -389,6 +389,10 @@ export function decide(
   mode: PermissionMode,
   opts: { commandClass?: CommandClass; recursiveDir?: boolean; cwdOutside?: boolean } = {},
 ): Policy {
+  // 'bypass' never interrupts the user: everything is granted, including protected paths and
+  // destructive commands. The gate still records each granted action (see `auditOnly`) so the
+  // consoles and the log show exactly what ran without a prompt.
+  if (mode === 'bypass') return 'allow';
   switch (kind) {
     case 'fs_read_outside':
       return mode === 'relaxed' ? 'allow' : 'ask';
@@ -501,8 +505,10 @@ export class PermissionGate {
     const policy = decide(kind, cfg.permissionMode, { recursiveDir: opts.recursiveDir });
     const summary = pathSummary(kind, r.real, opts.recursiveDir);
     const sessionPattern = allowlistEligible(kind) ? path.dirname(r.real) : null;
+    const auditOnly = cfg.permissionMode === 'bypass'
+      && decide(kind, 'balanced', { recursiveDir: opts.recursiveDir }) !== 'allow';
     return this.resolvePolicy(who, policy, {
-      kind, summary, sessionPattern,
+      kind, summary, sessionPattern, auditOnly,
       detail: { tool, args, path: r.real, hits },
     });
   }
@@ -540,9 +546,12 @@ export class PermissionGate {
 
     const policy = decide('command', cfg.permissionMode, { commandClass: c.class, cwdOutside });
     const short = truncate(command.replace(/\s+/g, ' ').trim(), 160).text;
+    // In bypass every command runs; classify anyway so the console says what it was.
+    const auditOnly = cfg.permissionMode === 'bypass';
     const res = await this.resolvePolicy(who, policy, {
       kind: 'command',
       commandClass: c.class,
+      auditOnly,
       summary: `Eseguire: ${short}`,
       sessionPattern: allowlistEligible('command', c.class) && !cwdOutside ? c.sessionPattern : null,
       detail: { tool, args, command, cwd: cwd.path, hits },
@@ -561,9 +570,24 @@ export class PermissionGate {
       summary: string;
       sessionPattern: string | null;
       detail: PermissionRequest['detail'];
+      /** True when only 'bypass' turned an ask/deny into an allow: worth showing, never blocking. */
+      auditOnly?: boolean;
     },
   ): Promise<GateResult> {
-    if (policy === 'allow') return { allowed: true, outcome: 'auto_allow', message: '' };
+    if (policy === 'allow') {
+      if (spec.auditOnly) {
+        this.deps.bus.emit(who.agentId, who.runId, {
+          kind: 'permission',
+          requestId: newId('bypass'),
+          permissionKind: spec.kind,
+          ...(spec.commandClass ? { commandClass: spec.commandClass } : {}),
+          summary: spec.summary,
+          status: 'auto_allow',
+        });
+        log(`bypass: granted without asking — ${spec.kind}: ${spec.summary}`);
+      }
+      return { allowed: true, outcome: 'auto_allow', message: '' };
+    }
 
     if (policy === 'deny') {
       this.deps.bus.emit(who.agentId, who.runId, {

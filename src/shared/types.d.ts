@@ -46,7 +46,7 @@
 //     it is intentionally not reproduced here (scaffolding must not add implementation files).
 
 export type AgentId = string;                 // "a_" + 8 hex; instances: "<templateId>#<path>[-rN]"
-export type PermissionMode = 'strict' | 'balanced' | 'relaxed';
+export type PermissionMode = 'strict' | 'balanced' | 'relaxed' | 'bypass';
 
 // ---------- roles / routing / budget (v2 §2) ----------
 export type AgentRole = 'orchestrator' | 'planner' | 'worker' | 'verifier';
@@ -90,8 +90,10 @@ export interface AppConfig {                    // config.json (main only)
   commandAllowlist: string[];                  // persistent patterns (settings-editable)
   showReasoning: boolean;                      // default true
   permissionTimeoutMs: number;                 // default 300000
-  /** @deprecated BREAKING (§2): replaced by `maxDepth`. TODO(v2-A): remove with orchestrator.ts/prompt.ts. */
-  maxDelegationDepth: number;                  // v1 default 3
+  /** @deprecated BREAKING (§2): replaced by `maxDepth`. Now OPTIONAL: config.ts §11.1 ignores it and
+   *  drops it on save, so v2 configs no longer carry it. TODO(v2-B): remove once settings.ts stops
+   *  reading `ConfigSnapshot.maxDelegationDepth` (already optional there). */
+  maxDelegationDepth?: number;                 // v1 default 3
   setupComplete: boolean;
   window?: { width: number; height: number; x?: number; y?: number };
   // v2 pool limits — SETTINGS (defaults = the lead's design; ranges in POOL_RANGES, §11.3).
