@@ -85,6 +85,20 @@ git push && git push --tags
 
 Un avvio manuale del workflow (senza tag) compila e carica solo gli artefatti della run, senza toccare le Release.
 
+### App non firmata: cosa vedrai al primo avvio
+
+I pacchetti non sono firmati con un certificato Apple Developer / Windows (serve un abbonamento a pagamento). Al primo avvio:
+
+- **macOS**: Gatekeeper mostra *"'Agents Pool.app' è danneggiato e non può essere aperto"* — non è vero, è solo l'app scaricata da
+  internet senza firma. Sblocco da Terminale (una volta sola, dopo aver spostato l'app in Applicazioni):
+  ```bash
+  xattr -cr "/Applications/Agents Pool.app"
+  ```
+- **Windows**: SmartScreen avvisa che l'app non è riconosciuta. *"Ulteriori informazioni"* → *"Esegui comunque"*.
+
+Per eliminare questi avvisi per chiunque scarichi l'app serve firmare i pacchetti: su macOS con un certificato Developer ID
+(`CSC_LINK`/`CSC_KEY_PASSWORD`, più la notarizzazione Apple), su Windows con un certificato di code signing.
+
 ## Test
 
 ```bash
