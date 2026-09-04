@@ -34,7 +34,7 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: false
       - uses: actions/upload-artifact@v4
         with:
-          name: agents-windows-${{ matrix.target }}
+          name: agents-pool-${{ matrix.target }}
           path: |
             release/*.dmg
             release/*.zip

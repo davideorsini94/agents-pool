@@ -1,4 +1,4 @@
-# Agents Windows
+# Agents Pool
 
 Finestra multi-console per un team di agenti AI alimentati da [OpenCode Go](https://opencode.ai/docs/go/).
 App desktop per **Linux, macOS e Windows** (Electron + TypeScript, nessuna dipendenza a runtime).
@@ -25,7 +25,7 @@ npm start
 ```
 
 `npm run dev` avvia con log verbosi (`--dev`). I log del processo main sono in `<userData>/logs/main.log`
-(`~/Library/Application Support/agents-windows` su macOS, `%APPDATA%/agents-windows` su Windows, `~/.config/agents-windows` su Linux).
+(`~/Library/Application Support/Agents Pool` su macOS, `%APPDATA%/Agents Pool` su Windows, `~/.config/Agents Pool` su Linux).
 
 ## Primo avvio
 
@@ -65,7 +65,7 @@ OPENCODE_API_KEY=sk-... node scripts/api-smoke.mjs   # client API: validazione c
 node scripts/e2e-smoke.mjs                             # app reale via Playwright: import chiave, setup, delega + scrittura file, permesso, hot reload
 ```
 
-Il test end-to-end usa una cartella dati isolata (`AGENTS_WINDOWS_USER_DATA`, utile anche per profili separati) e importa la chiave
+Il test end-to-end usa una cartella dati isolata (`AGENTS_POOL_USER_DATA`, utile anche per profili separati) e importa la chiave
 dalla CLI `opencode` tramite il pulsante dell'app; salva screenshot e log in `$E2E_SCRATCH`. Consuma qualche centesimo di quota Go.
 
 ## Struttura

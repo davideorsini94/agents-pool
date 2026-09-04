@@ -1,4 +1,4 @@
-# Agents Windows — Implementation Plan
+# Agents Pool — Implementation Plan
 
 Multi-console desktop window for a team of AI agents on OpenCode Go. Electron 44 + plain `tsc`, vanilla DOM renderer, zero runtime npm deps.
 Read `docs/RESEARCH.md` first (verified API contract). UI strings in Italian, code/comments in English, agent system prompts in English.
@@ -27,7 +27,7 @@ Requirement map: R1 key+validation → §4/§9.1 · R2 wizard → §9.2 · R3 in
 ## 1. Directory / file layout (22 source files + config)
 
 ```
-agents-windows/
+agents-pool/
 ├─ package.json                  scripts (given) + "build" key (§12.1)
 ├─ tsconfig.main.json            main + preload → dist/main (CJS)
 ├─ tsconfig.renderer.json        renderer → dist/renderer (ESM)
@@ -262,7 +262,7 @@ class OpenCodeClient {
   streamChat(req: { model: string; messages: ChatMessage[]; tools?: ToolDef[]; sessionId: string; maxTokens?: number }, h: StreamHandlers, signal: AbortSignal): Promise<StreamResult>
 }
 ```
-- Headers: `Authorization: Bearer`, `Content-Type: application/json`, `x-opencode-session: <sessionId>`, `User-Agent: agents-windows/<version>`. Body adds `stream: true, stream_options: { include_usage: true }, tool_choice: 'auto'` (when tools present).
+- Headers: `Authorization: Bearer`, `Content-Type: application/json`, `x-opencode-session: <sessionId>`, `User-Agent: agents-pool/<version>`. Body adds `stream: true, stream_options: { include_usage: true }, tool_choice: 'auto'` (when tools present).
 - Error mapping: non-2xx → read body → `{error:{type,message}}`: 401+AuthError→`AuthError`; 401+ModelError→`ModelError`; 429→`RateLimit` (retryAfterMs from `Retry-After` header else 20 s); 5xx→`Server` (retryable); fetch `TypeError`/`ECONNRESET`→`Network` (retryable); `AbortError`→`Abort`. `KeyValidationResult.reason`: AuthError→`auth`, Network→`network`, ModelError→`model`, RateLimit→`rate_limit`, else `unknown`.
 - SSE parser: read `body` via `TextDecoder(stream:true)`; buffer; split on `\n`; for lines starting with `data:` → trim → `[DONE]` ends; else `JSON.parse`. Chunk with top-level `error` → throw `ApiError('Protocol'|mapped)`. For `choices[0].delta`: `reasoning_content ?? reasoning` → onReasoning; `content` → onText; `tool_calls[]` → onToolCallDelta per item; `choices[0].finish_reason` recorded; chunk with `usage` (choices may be empty) → onUsage (also read top-level `cost` string if present). Idle watchdog: no bytes for 120 s → abort with `Network` error (retryable).
 - `Usage` normalization: `prompt_tokens, completion_tokens, prompt_tokens_details.cached_tokens, completion_tokens_details.reasoning_tokens`, `cost` parsed float. If no usage arrives: estimate `chars/4` for prompt and completion, `cost` from ModelInfo prices, `estimated: true`.
@@ -336,7 +336,7 @@ per call:
 
 ### 5.5 System prompt (`prompt.ts`, English)
 ```
-You are "{name}", an AI agent in a team of {N} agents inside the desktop app "Agents Windows".
+You are "{name}", an AI agent in a team of {N} agents inside the desktop app "Agents Pool".
 {MAIN:  You are the MAIN agent, the only one who talks to the user. Every user message arrives to you. Your final message without tool calls is shown to the user as the team's result — always end with a complete final answer. Delegate sub-tasks with delegate_task when a teammate's role fits, then integrate the results yourself.}
 {OTHER: You are a SPECIALIST agent. Tasks reach you by delegation from a teammate; your final message without tool calls is returned verbatim to that teammate (not to the user). Be complete, factual and concise. Never address the user directly except through ask_user when truly blocked.}
 
@@ -395,7 +395,7 @@ Final answer = assistant message without tool calls (no `finish` tool).
 ### 6.2 Shell per OS
 - unix: `spawn('/bin/sh', ['-c', command], {cwd, env, detached:true})`; user shell from `$SHELL` only for `system_info` reporting.
 - win32: `spawn('cmd.exe', ['/d','/s','/c', command], {cwd, env, windowsHide:true})`; if command starts with `powershell`/`pwsh` it is still fine via cmd. Encoding: set `chcp 65001` is NOT injected; decode stdout as UTF-8 and fall back to latin1 on invalid sequences.
-- `env`: process env + `AGENTS_WINDOWS=1`, `NO_COLOR=1`, `CI=1`, `GIT_TERMINAL_PROMPT=0`, plus tool-provided `env` (cannot override PATH/HOME).
+- `env`: process env + `AGENTS_POOL=1`, `NO_COLOR=1`, `CI=1`, `GIT_TERMINAL_PROMPT=0`, plus tool-provided `env` (cannot override PATH/HOME).
 
 ---
 
@@ -475,7 +475,7 @@ Deadlock-freedom: waits only go parent→child; ancestry check forbids any edge 
 Routing in `index.ts`: `getInfo()` → `!hasApiKey` → KeyScreen; `!setupComplete` → Wizard; else Workbench. Subscribe to all `EventMap` channels once at bootstrap; a small in-renderer store (`Map<AgentId, ConsoleView>`, `snapshot`, `config`) dispatches.
 
 ### 9.1 KeyScreen (`key-screen.ts`)
-Centered card: title "Agents Windows", text "Inserisci la tua API key di OpenCode Go", password input (toggle show), buttons "Verifica e continua" (primary) and "Importa da opencode CLI" (secondary, calls `key:importFromOpencode`). While validating: spinner + disabled. Error mapping: `auth` → "Chiave non valida"; `network` → "Nessuna connessione a opencode.ai — controlla la rete"; `rate_limit` → "Limite di utilizzo raggiunto, riprova tra poco"; `model` → "Modello di verifica non disponibile (glm-5.3-flash)"; `unknown` → message. On ok → Wizard.
+Centered card: title "Agents Pool", text "Inserisci la tua API key di OpenCode Go", password input (toggle show), buttons "Verifica e continua" (primary) and "Importa da opencode CLI" (secondary, calls `key:importFromOpencode`). While validating: spinner + disabled. Error mapping: `auth` → "Chiave non valida"; `network` → "Nessuna connessione a opencode.ai — controlla la rete"; `rate_limit` → "Limite di utilizzo raggiunto, riprova tra poco"; `model` → "Modello di verifica non disponibile (glm-5.3-flash)"; `unknown` → message. On ok → Wizard.
 
 ### 9.2 SetupWizard (`wizard.ts`) — 4 steps, progress dots, "Indietro/Avanti"
 1. **Workspace**: path field (read-only) + "Scegli cartella…" (`config:chooseWorkspace`). Required.
@@ -570,15 +570,15 @@ Resume on launch (`Orchestrator.resume()`): load config → for each agent load 
 ### 12.1 `package.json` additions
 ```json
 "build": {
-  "appId": "dev.agentswindows.app",
-  "productName": "Agents Windows",
+  "appId": "dev.agentspool.app",
+  "productName": "Agents Pool",
   "directories": { "output": "release", "buildResources": "build" },
   "files": ["dist/**/*", "src/renderer/index.html", "src/renderer/styles.css", "package.json"],
   "asar": true,
   "mac": { "category": "public.app-category.developer-tools", "target": [{ "target": "dmg", "arch": ["arm64", "x64"] }], "icon": "build/icon.png", "identity": null },
   "win": { "target": [{ "target": "nsis", "arch": ["x64"] }], "icon": "build/icon.png" },
   "nsis": { "oneClick": false, "allowToChangeInstallationDirectory": true },
-  "linux": { "target": ["AppImage", "deb"], "category": "Development", "icon": "build/icon.png", "maintainer": "agents-windows" }
+  "linux": { "target": ["AppImage", "deb"], "category": "Development", "icon": "build/icon.png", "maintainer": "agents-pool" }
 }
 ```
 (`identity: null` = unsigned mac build; only mac is verified locally. `build/icon.png` 512×512; electron-builder converts.)
@@ -598,7 +598,7 @@ Renderer imports use `.js` extensions (`import { h } from './dom.js'`); shared t
 
 ### 12.3 Window & security (`main.ts`)
 ```ts
-new BrowserWindow({ width: cfg.window?.width ?? 1440, height: 900, minWidth: 960, minHeight: 600, backgroundColor: '#0f1115', title: 'Agents Windows',
+new BrowserWindow({ width: cfg.window?.width ?? 1440, height: 900, minWidth: 960, minHeight: 600, backgroundColor: '#0f1115', title: 'Agents Pool',
   webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true, spellcheck: false } });
 win.loadFile(path.join(__dirname, '../../src/renderer/index.html'));   // works from asar too (files listed in build.files)
 win.webContents.setWindowOpenHandler(() => ({ action: 'deny' })); win.webContents.on('will-navigate', e => e.preventDefault());

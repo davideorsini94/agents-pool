@@ -1,4 +1,4 @@
-// Shared ambient types for Agents Windows — transcribed verbatim from docs/PLAN.md §2 (data model)
+// Shared ambient types for Agents Pool — transcribed verbatim from docs/PLAN.md §2 (data model)
 // and §3 (IPC contract). This file is types-only (.d.ts, never emitted); it is the frozen contract
 // between the main-process and renderer implementation streams (see PLAN §1, §13 "Step 0").
 //

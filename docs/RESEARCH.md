@@ -2,7 +2,7 @@
 
 Base URL: `https://opencode.ai/zen/go/v1`  (docs: https://opencode.ai/docs/go/)
 Auth: `Authorization: Bearer <key>` — keys start with `sk-` (67 chars observed).
-Recommended headers: `x-opencode-session: <stable id per conversation>` (prompt caching), a specific `User-Agent` (e.g. `agents-windows/<version>`; docs ask tools to identify themselves).
+Recommended headers: `x-opencode-session: <stable id per conversation>` (prompt caching), a specific `User-Agent` (e.g. `agents-pool/<version>`; docs ask tools to identify themselves).
 
 ## Endpoints
 - `GET /models` → `{"object":"list","data":[{"id":"glm-5.3-flash","object":"model",...}]}`

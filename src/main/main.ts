@@ -16,7 +16,7 @@ import { Send, fmtErr, initLog, log, logError, logWarn } from './util';
 
 const DEV = process.argv.includes('--dev');
 // Isolated data dir for tests/CI (scripts/e2e-smoke.mjs). Must run before 'ready'.
-if (process.env.AGENTS_WINDOWS_USER_DATA) app.setPath('userData', path.resolve(process.env.AGENTS_WINDOWS_USER_DATA));
+if (process.env.AGENTS_POOL_USER_DATA) app.setPath('userData', path.resolve(process.env.AGENTS_POOL_USER_DATA));
 const SCHEME = 'app';
 const HOST = 'root';
 const RENDERER_ENTRY = `${SCHEME}://${HOST}/src/renderer/index.html`;
@@ -199,7 +199,7 @@ function registerProtocol(): void {
 }
 
 function notFound(message: string): Response {
-  const html = `<!doctype html><meta charset="utf-8"><title>Agents Windows</title>`
+  const html = `<!doctype html><meta charset="utf-8"><title>Agents Pool</title>`
     + `<body style="background:#0f1115;color:#e6e6e6;font:14px system-ui;padding:24px">`
     + `<h1 style="font-size:18px">Interfaccia non disponibile</h1>`
     + `<p style="color:#8b93a7">${escapeHtml(message)}</p></body>`;
@@ -236,7 +236,7 @@ function createWindow(config: ConfigStore): void {
     minWidth: 960,
     minHeight: 600,
     backgroundColor: '#0f1115',
-    title: 'Agents Windows',
+    title: 'Agents Pool',
     show: false,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),

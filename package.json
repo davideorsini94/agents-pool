@@ -1,6 +1,6 @@
 {
-  "name": "agents-windows",
-  "productName": "Agents Windows",
+  "name": "agents-pool",
+  "productName": "Agents Pool",
   "version": "0.1.0",
   "description": "Multi-console desktop window for a team of AI agents powered by OpenCode Go",
   "main": "dist/main/main.js",
@@ -23,8 +23,8 @@
     "typescript": "^5.9.3"
   },
   "build": {
-    "appId": "dev.agentswindows.app",
-    "productName": "Agents Windows",
+    "appId": "dev.agentspool.app",
+    "productName": "Agents Pool",
     "directories": {
       "output": "release",
       "buildResources": "build"
@@ -72,7 +72,7 @@
       ],
       "category": "Development",
       "icon": "build/icon.png",
-      "maintainer": "agents-windows"
+      "maintainer": "agents-pool"
     }
   }
 }

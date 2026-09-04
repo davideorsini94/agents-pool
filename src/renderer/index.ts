@@ -98,7 +98,7 @@ class App {
     replace(this.mount,
       h('div', { class: 'screen center' },
         h('div', { class: 'card' },
-          h('div', { class: 'brand sm' }, 'Agents ', h('span', { class: 'accent', text: 'Windows' })),
+          h('div', { class: 'brand sm' }, 'Agents ', h('span', { class: 'accent', text: 'Pool' })),
           h('div', { class: 'err' }, h('strong', { text: 'Avvio non riuscito' }), h('span', { class: 'detail', text: message })),
           btn('Riprova', () => void this.route(), 'btn primary wide'))));
   }
@@ -108,7 +108,7 @@ function noApi(el: HTMLElement): void {
   replace(el,
     h('div', { class: 'screen center' },
       h('div', { class: 'card' },
-        h('div', { class: 'brand sm' }, 'Agents ', h('span', { class: 'accent', text: 'Windows' })),
+        h('div', { class: 'brand sm' }, 'Agents ', h('span', { class: 'accent', text: 'Pool' })),
         h('div', { class: 'err' },
           h('strong', { text: 'Ponte IPC non disponibile' }),
           h('span', { class: 'detail', text: 'window.api non è stato esposto: apri l’app con "npm start" invece di caricare il file nel browser.' })))));

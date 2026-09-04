@@ -21,7 +21,7 @@ export function buildSystemPrompt(
   const isMain = agent.id === cfg.mainAgentId;
   const lines: string[] = [];
 
-  lines.push(`You are "${agent.name}", an AI agent in a team of ${n} agent${n === 1 ? '' : 's'} inside the desktop app "Agents Windows".`);
+  lines.push(`You are "${agent.name}", an AI agent in a team of ${n} agent${n === 1 ? '' : 's'} inside the desktop app "Agents Pool".`);
   lines.push('');
   if (isMain) {
     lines.push('You are the MAIN agent, the only one who talks to the user. Every user message arrives to you. Your final message without tool calls is shown to the user as the team\'s result — always end with a complete final answer. Delegate sub-tasks with delegate_task when a teammate\'s role fits, then integrate the results yourself.');

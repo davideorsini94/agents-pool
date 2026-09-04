@@ -80,7 +80,7 @@ export class OpenCodeClient {
     const key = keyOverride ?? this.getKey();
     const h: Record<string, string> = {
       'Content-Type': 'application/json',
-      'User-Agent': `agents-windows/${this.version}`,
+      'User-Agent': `agents-pool/${this.version}`,
     };
     if (key) h.Authorization = `Bearer ${key}`;
     if (sessionId) h['x-opencode-session'] = sessionId;

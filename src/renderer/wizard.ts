@@ -63,7 +63,7 @@ export class SetupWizard {
     this.root = h('div', { class: 'screen center' },
       h('div', { class: 'card wiz-card' },
         h('div', { class: 'wiz-head' },
-          h('div', { class: 'brand sm' }, 'Agents ', h('span', { class: 'accent', text: 'Windows' })),
+          h('div', { class: 'brand sm' }, 'Agents ', h('span', { class: 'accent', text: 'Pool' })),
           this.dotsEl),
         this.bodyEl,
         this.errEl,

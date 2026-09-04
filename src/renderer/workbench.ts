@@ -81,8 +81,8 @@ export class Workbench {
     const head = h('header', { class: 'app-head' },
       h('span', {
         class: 'app-name',
-        title: 'Agents Windows v' + info.version + ' · ' + info.platform + '/' + info.arch + '\n' + info.userDataPath,
-      }, 'Agents ', h('span', { class: 'accent', text: 'Windows' })),
+        title: 'Agents Pool v' + info.version + ' · ' + info.platform + '/' + info.arch + '\n' + info.userDataPath,
+      }, 'Agents ', h('span', { class: 'accent', text: 'Pool' })),
       this.pathBtn,
       this.statusPill,
       this.totalsEl,

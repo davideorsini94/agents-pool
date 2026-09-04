@@ -3,14 +3,14 @@
 // runs a delegation task that writes a file, then a command that needs a permission, and
 // finally exercises hot reload. Run after `npm run build`:
 //   node scripts/e2e-smoke.mjs            (needs ~/.local/share/opencode/auth.json with opencode-go key)
-// Screenshots + log end up in $E2E_SCRATCH (default: os.tmpdir()/agents-windows-e2e-<ts>).
+// Screenshots + log end up in $E2E_SCRATCH (default: os.tmpdir()/agents-pool-e2e-<ts>).
 import { _electron as electron } from 'playwright-core';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
 const root = process.cwd();
-const scratch = process.env.E2E_SCRATCH || path.join(os.tmpdir(), `agents-windows-e2e-${Date.now()}`);
+const scratch = process.env.E2E_SCRATCH || path.join(os.tmpdir(), `agents-pool-e2e-${Date.now()}`);
 const userData = path.join(scratch, 'userData');
 const workspace = path.join(scratch, 'workspace');
 const shots = path.join(scratch, 'shots');
@@ -25,7 +25,7 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 let app;
 try {
-  app = await electron.launch({ args: ['.', '--dev'], cwd: root, env: { ...process.env, AGENTS_WINDOWS_USER_DATA: userData, ELECTRON_ENABLE_LOGGING: '1' }, timeout: 60000 });
+  app = await electron.launch({ args: ['.', '--dev'], cwd: root, env: { ...process.env, AGENTS_POOL_USER_DATA: userData, ELECTRON_ENABLE_LOGGING: '1' }, timeout: 60000 });
   app.process().stderr?.on('data', d => { const s = String(d).trim(); if (s) logLines.push('[main:stderr] ' + s); });
   // With --dev the detached DevTools window may be created first: pick the app window (app:// URL).
   let page = await app.firstWindow();

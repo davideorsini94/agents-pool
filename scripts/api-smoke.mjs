@@ -98,7 +98,7 @@ let usageSeen = null;
 const stream = await client.streamChat(
   {
     model: MODEL,
-    sessionId: 'agents-windows-smoke',
+    sessionId: 'agents-pool-smoke',
     maxTokens: 300,
     messages: [{ role: 'user', content: 'What time is it in Rome? You must call the get_time tool with tz="Europe/Rome".' }],
     tools,

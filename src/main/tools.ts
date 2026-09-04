@@ -467,7 +467,7 @@ export function runShell(
     const { file, argv } = shellFor(command);
     const env: Record<string, string> = {
       ...(process.env as Record<string, string>),
-      AGENTS_WINDOWS: '1',
+      AGENTS_POOL: '1',
       NO_COLOR: '1',
       CI: '1',
       GIT_TERMINAL_PROMPT: '0',

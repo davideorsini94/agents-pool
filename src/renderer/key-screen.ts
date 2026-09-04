@@ -58,7 +58,7 @@ export class KeyScreen {
 
     this.root = h('div', { class: 'screen center' },
       h('div', { class: 'card key-card' },
-        h('div', { class: 'brand' }, 'Agents ', h('span', { class: 'accent', text: 'Windows' })),
+        h('div', { class: 'brand' }, 'Agents ', h('span', { class: 'accent', text: 'Pool' })),
         h('p', { class: 'lead', text: 'Inserisci la tua API key di OpenCode Go per iniziare.' }),
         h('div', { class: 'key-row' }, this.input, eye),
         this.errBox,
