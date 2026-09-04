@@ -1,7 +1,7 @@
 {
   "name": "agents-pool",
   "productName": "Agents Pool",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Multi-console desktop window for a team of AI agents powered by OpenCode Go",
   "main": "dist/main/main.js",
   "private": true,
