@@ -25,8 +25,10 @@ const MODEL_OUTPUT_CAP = 16000;
 const POOL_OUTPUT_CAP = 32768;
 const POOL_TOOLS = new Set(['delegate_tasks', 'run_planner', 'run_verifier', 'read_artifact']);
 /** Per-call ceiling derived from the remaining instance budget (PLAN-v2 §6.2). */
-const MIN_CALL_TOKENS = 512;
-const MAX_CALL_TOKENS = 8192;
+// Floor for a single call's answer. A reasoning model needs several thousand tokens before it even
+// starts the visible answer, so a small floor guarantees a truncated (finish_reason: length) reply.
+const MIN_CALL_TOKENS = 4096;
+const MAX_CALL_TOKENS = 16384;
 
 /** What the runtime needs from the orchestrator (implemented by Orchestrator). */
 export interface AgentHost extends OrchestratorApi {
@@ -353,6 +355,7 @@ export class AgentRuntime {
               signal,
             );
             finishReason = r.finishReason;
+            if (r.finishReason === 'length') run.truncated = true;
             break;
           } catch (e) {
             const err = e instanceof ApiError ? e : new ApiError('Unknown', fmtErr(e));
@@ -551,14 +554,20 @@ export class AgentRuntime {
       usage: cloneUsage(run.usage),
       toolCalls: run.toolCalls ?? 0,
       ...(run.budgetHit ? { budgetHit: run.budgetHit } : {}),
+      ...(run.truncated ? { truncated: true } : {}),
     };
   }
 
-  /** `max_tokens` derived from what is left of the instance budget (PLAN-v2 §6.2). */
+  /**
+   * `max_tokens` for one call (PLAN-v2 §6.2). Only *completion* tokens are subtracted: the prompt is
+   * re-sent and re-counted at every iteration, so charging it against the answer allowance made the
+   * room to reply collapse after the first iteration — measured: a Planner with a 6000-token budget
+   * got 4500 tokens on iteration 2 and was cut off (`finish_reason: length`) before writing its JSON.
+   * The cost budget still stops the run through the cumulative check in the loop.
+   */
   private callTokenCap(run: RunState): number | undefined {
     if (!this.opts) return undefined;
-    const used = run.usage.promptTokens + run.usage.completionTokens;
-    const left = this.opts.budget.maxTokens - used;
+    const left = this.opts.budget.maxTokens - run.usage.completionTokens;
     return Math.max(MIN_CALL_TOKENS, Math.min(MAX_CALL_TOKENS, left));
   }
 

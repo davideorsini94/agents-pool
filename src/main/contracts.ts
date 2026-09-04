@@ -272,7 +272,7 @@ function coerceStatus(raw: string): ResultStatus | null {
 export async function parseResultContract(
   text: string,
   contract: TaskContract,
-  run: Pick<TaskResult, 'status' | 'usage' | 'budgetHit' | 'toolCalls'>,
+  run: Pick<TaskResult, 'status' | 'usage' | 'budgetHit' | 'toolCalls'> & { truncated?: boolean },
   opts: ParseResultOpts,
 ): Promise<ParsedResult> {
   const raw = String(text ?? '');
@@ -341,7 +341,9 @@ export async function parseResultContract(
       ? parsed.blocking_question.trim()
       : null;
   } else {
-    unverified.push('output not in ResultContract format');
+    unverified.push(run.truncated
+      ? 'risposta troncata prima del JSON (budget token esaurito): alza il budget del template'
+      : 'output not in ResultContract format');
   }
 
   // 4. the run itself failed / was cut short
@@ -407,10 +409,18 @@ export function syntheticResult(
 const MAX_PLAN_TASKS = 6;
 
 /** §7.4 — invalid tasks are dropped with a warning, never fatal. */
-export function parsePlan(text: string, opts: { workspacePath: string | null }): Plan {
+export function parsePlan(
+  text: string,
+  opts: { workspacePath: string | null; truncated?: boolean },
+): Plan {
   const parsed = extractObject(text);
   if (!parsed) {
-    return { tasks: [], assumptions: [], if_false: [], warnings: ['plan not in JSON format'], raw: String(text ?? '').slice(0, 4000) };
+    // Distinguish "the model wrote prose" from "the answer was cut off": the second is a budget
+    // problem the user can fix in Settings, and it used to be reported as a format error.
+    const why = opts.truncated || !String(text ?? '').trim()
+      ? 'risposta troncata prima del JSON (budget token del Planner esaurito): alza "budget per task" del template Planner nelle impostazioni, oppure riduci l\'obiettivo'
+      : 'plan not in JSON format';
+    return { tasks: [], assumptions: [], if_false: [], warnings: [why], raw: String(text ?? '').slice(0, 4000) };
   }
   const warnings: string[] = [];
   const rawTasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];

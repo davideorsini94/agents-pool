@@ -27,8 +27,10 @@ import {
 } from './util';
 
 const TIER_ORDER: Tier[] = ['T0', 'T1', 'T2', 'T3'];
-const PLANNER_BUDGET: Budget = { maxTokens: 6000, maxToolCalls: 6, maxSeconds: 120 };
-const VERIFIER_BUDGET: Budget = { maxTokens: 8000, maxToolCalls: 8, maxSeconds: 150 };
+// Fallbacks when a template carries no budget. Sized on measured runs: a planner writing a 6-task
+// plan spends 10k+ tokens of reasoning before the JSON, a verifier reads several results.
+const PLANNER_BUDGET: Budget = { maxTokens: 20000, maxToolCalls: 8, maxSeconds: 240 };
+const VERIFIER_BUDGET: Budget = { maxTokens: 20000, maxToolCalls: 8, maxSeconds: 240 };
 /** Requests whose artifact directories are kept on disk (§7.6). */
 const KEEP_ARTIFACT_REQUESTS = 20;
 
@@ -618,10 +620,17 @@ export class InstancePool {
       effectiveBudget(undefined, template.budget ?? PLANNER_BUDGET), true, message, callId);
     if (!r) return 'ERROR: no planner template configured — plan inline';
 
-    const plan = parsePlan(r.text, { workspacePath: cfg.workspacePath });
+    const plan = parsePlan(r.text, { workspacePath: cfg.workspacePath, truncated: r.truncated });
     this.deps.contracts.append({
       requestId: ctx.requestId, kind: 'plan', template: template.name, data: plan,
     });
+    // An empty plan is a failure, not a result: returning it as-is made the orchestrator retry the
+    // identical call (measured: two 3-minute planner runs wasted before it decomposed by itself).
+    if (!plan.tasks.length) {
+      const why = plan.warnings[0] ?? 'nessun task prodotto';
+      logWarn(`planner produced no tasks (${why})`);
+      return `ERROR: il Planner non ha prodotto task (${why}) — non richiamare run_planner con lo stesso obiettivo: scomponi tu il lavoro e delega con delegate_tasks`;
+    }
     return JSON.stringify(plan);
   }
 

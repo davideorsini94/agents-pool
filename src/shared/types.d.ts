@@ -193,11 +193,15 @@ export type TaskOrigin =
 export interface Task { id: string; agentId: AgentId; origin: TaskOrigin; input: string; context?: string; createdAt: number; contract?: TaskContract }
 export type RunStatus = 'queued'|'running'|'waiting_permission'|'waiting_user'|'waiting_delegate'|'done'|'error'|'cancelled'|'partial';
 export interface RunState { runId: string; taskId: string; agentId: AgentId; origin: TaskOrigin; status: RunStatus; iteration: number;
+  /** Set when a model reply came back with finish_reason 'length': the answer was cut off. */
+  truncated?: boolean;
   startedAt: number; finishedAt?: number; usage: Usage; ancestry: AgentId[]; /* agents up the chain incl. self */ childRunIds: string[];
   // v2 (§6.2). TODO(v2-A): requestId/role/toolCalls become required with agent.ts instance mode.
   requestId?: string; role?: AgentRole; budget?: Budget; toolCalls?: number; budgetHit?: keyof Budget }
 export interface TaskResult { status: 'done'|'error'|'cancelled'|'partial'; text: string; runId: string; usage: Usage;
-  budgetHit?: keyof Budget; toolCalls?: number }                                   // TODO(v2-A): toolCalls required with instance mode
+  budgetHit?: keyof Budget; toolCalls?: number;                                    // TODO(v2-A): toolCalls required with instance mode
+  /** A model reply came back with finish_reason 'length': the answer was cut off mid-sentence. */
+  truncated?: boolean }
 export type AgentStatus = 'idle'|'thinking'|'streaming'|'tool'|'waiting_permission'|'waiting_user'|'waiting_delegate'|'error';
 export interface AgentStatusUpdate { agentId: AgentId; status: AgentStatus; runId: string | null; queueLength: number; usage: Usage; detail?: string }
 export interface RunFinished { runId: string; agentId: AgentId; status: 'done'|'error'|'cancelled'|'partial'; isUserRun: boolean; finalText: string; usage: Usage; tier?: Tier }

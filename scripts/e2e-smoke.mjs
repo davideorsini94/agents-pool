@@ -332,6 +332,38 @@ try {
       stillBusy.map(([id, a]) => `${id}:${a.status}`).join(',') || `instances listed=${(rs.instances || []).length}`);
   }
 
+  // ================================================================= 6b. hot reload of the orchestrator prompt while the pool is working
+  if (!SKIP.has('6b')) {
+    const before = (await events(mainId)).length;
+    await send('Crea in parallelo con due worker distinti i file h1.txt e h2.txt, ognuno con una frase di due righe che descrive il proprio nome, poi confermami l\'esito.');
+    // wait until the pool is genuinely busy, then edit the prompt of the agent that is working
+    for (let i = 0; i < 200; i++) {
+      const s2 = await api('runtime:getSnapshot');
+      if ((s2.instances || []).length >= 1) break;
+      await sleep(700);
+    }
+    await api('config:updateAgent', mainId, { prompt: 'Coordinatore del pool.\nPrompt cambiato a caldo durante il lavoro: rispondi sempre in due righe.' });
+    await api('config:update', { permissionMode: 'balanced' });
+    await sleep(600);
+    await shot('07b-prompt-hot-reload');
+    await waitIdle(360000);
+    await sleep(800);
+    const evs = (await events(mainId)).slice(before);
+    const every6b = await allEvents();
+    check('hot reload: the run resumes and finishes after editing the working agent prompt',
+      evs.some(e => e.kind === 'task_end' && e.status === 'done'),
+      evs.filter(e => e.kind === 'task_end').map(e => e.status).join(',') || 'no task_end');
+    const madeH = ['h1.txt', 'h2.txt'].filter(f => fs.existsSync(path.join(workspace, f)));
+    check('hot reload: the delegated work still landed', madeH.length >= 1, `created=${madeH.join(',')}`);
+    // the token cap must never shrink an answer to nothing: no reply may come back truncated
+    const cut = every6b.filter(e => e.kind === 'llm_call' && e.finishReason === 'length');
+    check('no model reply was truncated by the per-call token cap', cut.length === 0,
+      cut.map(e => `${e.model}@iter${e.iteration}`).join(',') || '');
+    const noDeliverable = every6b.filter(e => e.kind === 'delegation' && e.result
+      && /troncata|not in ResultContract/i.test(JSON.stringify(e.result.unverified || [])));
+    check('no delegation came back truncated', noDeliverable.length === 0, `${noDeliverable.length}`);
+  }
+
   // ================================================================= 7. permission modal + hot reload mid-run
   if (!SKIP.has('7')) {
     const outFile = path.join(outside, 'fuori.txt');
