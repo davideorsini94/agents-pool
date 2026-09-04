@@ -29,6 +29,12 @@
       "output": "release",
       "buildResources": "build"
     },
+    "publish": {
+      "provider": "github",
+      "owner": "davideorsini94",
+      "repo": "agents-pool",
+      "releaseType": "release"
+    },
     "files": [
       "dist/**/*",
       "src/renderer/index.html",
