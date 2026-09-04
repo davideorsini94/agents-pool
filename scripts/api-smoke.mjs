@@ -174,6 +174,30 @@ check('allowlist wildcard `git *`', matchesAllowlist('git status', ['git *']) ==
 
 // ---------------------------------------------------------------- 5. path sandbox
 
+section('permission policy: modes and bypass');
+{
+  const { decide } = require('../dist/main/permissions.js');
+  const KINDS = ['fs_read_outside', 'fs_read_protected', 'fs_write_inside', 'fs_write_outside',
+    'fs_delete_inside', 'fs_delete_outside'];
+  const CLASSES = ['benign', 'sensitive', 'privileged', 'destructive'];
+  // bypass never asks and never denies: that is the whole point of the mode.
+  const bypassAsks = [
+    ...KINDS.map((k) => decide(k, 'bypass')),
+    ...CLASSES.map((c) => decide('command', 'bypass', { commandClass: c })),
+    decide('command', 'bypass', { commandClass: 'benign', cwdOutside: true }),
+    decide('fs_delete_inside', 'bypass', { recursiveDir: true }),
+  ];
+  check('bypass allows every action without asking', bypassAsks.every((p) => p === 'allow'),
+    [...new Set(bypassAsks)].join(','));
+  // the other three modes must be untouched by the new mode
+  check('strict still denies destructive commands', decide('command', 'strict', { commandClass: 'destructive' }) === 'deny');
+  check('balanced still asks before writing outside the workspace', decide('fs_write_outside', 'balanced') === 'ask');
+  check('relaxed still asks for privileged commands', decide('command', 'relaxed', { commandClass: 'privileged' }) === 'ask');
+  check('only bypass auto-allows a protected read',
+    ['strict', 'balanced', 'relaxed'].every((m) => decide('fs_read_protected', m) !== 'allow')
+    && decide('fs_read_protected', 'bypass') === 'allow');
+}
+
 section('resolvePath sandbox');
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aw-smoke-'));
 const ws = path.join(tmpRoot, 'workspace');
@@ -503,7 +527,7 @@ const { ApiError } = require('../dist/main/api.js');
 section('contracts: validation, parsing, artifacts, log');
 const {
   validateTaskContract, validateBatch, parseResultContract, parsePlan, parseVerdict,
-  effectiveBudget, poolLimits, POOL_RANGES, ContractsLog,
+  effectiveBudget, poolLimits, POOL_RANGES, ContractsLog, DEFAULT_BUDGET,
 } = require('../dist/main/contracts.js');
 const { ArtifactStore } = require('../dist/main/artifacts.js');
 
@@ -522,7 +546,14 @@ const okRaw = {
 const v1 = validateTaskContract(okRaw, 0, { workspacePath: cWs });
 check('valid contract passes', !!v1.ok, JSON.stringify(v1).slice(0, 120));
 check('snake_case budget normalized', v1.ok?.budget?.maxTokens === 999999 && v1.ok?.budget?.maxToolCalls === 3, JSON.stringify(v1.ok?.budget));
-check('HARD_MAX clamps the budget', effectiveBudget(v1.ok.budget, undefined).maxTokens === 60000, JSON.stringify(effectiveBudget(v1.ok.budget, undefined)));
+// The budget written into a contract by a model is advisory: the template (or DEFAULT) is enforced.
+check('a contract budget never overrides the template',
+  effectiveBudget(v1.ok.budget, undefined).maxTokens === DEFAULT_BUDGET.maxTokens
+  && effectiveBudget({ maxTokens: 1500 }, { maxTokens: 12000, maxToolCalls: 8, maxSeconds: 150 }).maxTokens === 12000,
+  JSON.stringify(effectiveBudget(v1.ok.budget, undefined)));
+check('HARD_MAX clamps a template budget',
+  effectiveBudget(undefined, { maxTokens: 999999, maxToolCalls: 999, maxSeconds: 99999 }).maxTokens === 60000,
+  JSON.stringify(effectiveBudget(undefined, { maxTokens: 999999, maxToolCalls: 999, maxSeconds: 99999 })));
 check('missing acceptance is rejected',
   !!validateTaskContract({ ...okRaw, acceptance: '' }, 0, { workspacePath: cWs }).error,
   validateTaskContract({ ...okRaw, acceptance: '' }, 0, { workspacePath: cWs }).error);
@@ -914,8 +945,10 @@ function task(id, role, objective, sideEffects = false) {
   check('maxSeconds kill returns partial', out.results[0].status === 'partial', JSON.stringify(out.results[0]).slice(0, 160));
   const endEv = H.state.getConsole('a_wk#s1', { limit: 100 }).find((e) => e.kind === 'task_end');
   check('task_end reports budgetHit=maxSeconds', endEv?.budgetHit === 'maxSeconds', String(endEv?.budgetHit));
-  check('max_tokens per call is derived from the remaining budget',
-    H.calls[0].maxTokens === 8192, String(H.calls[0].maxTokens));
+  // Only completion tokens are charged against the answer allowance: charging the (re-sent) prompt
+  // collapsed it to the floor after a couple of iterations and truncated every later reply.
+  check('max_tokens per call is derived from completion tokens only, never below the floor',
+    H.calls[0].maxTokens >= 4096 && H.calls[0].maxTokens <= 16384, String(H.calls[0].maxTokens));
   await H.contracts.flush();
   fs.rmSync(H.root, { recursive: true, force: true });
 }
