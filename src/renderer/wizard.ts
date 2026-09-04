@@ -117,7 +117,7 @@ const T = {
   prompt: 'Prompt di sistema del template. L’app gli aggiunge sempre le regole fisse del ruolo; i dati che cambiano (contratto, ambiente, input) arrivano nel messaggio, non qui.',
   budgetTok: 'Tetto di token (prompt + risposta) per ogni istanza di questo template: al superamento l’istanza viene fermata e consegna quello che ha prodotto con esito "parziale". Vuoto = 8000.',
   budgetTool: 'Numero massimo di chiamate a strumenti per istanza: al superamento l’istanza chiude con esito "parziale". Vuoto = 10.',
-  budgetSec: 'Tempo massimo per istanza: allo scadere viene fermata con esito "parziale". Vuoto = 180 s. Alzarlo aiuta i task lunghi ma allunga anche le richieste sbagliate.',
+  budgetSec: 'Secondi di silenzio dal modello prima di considerare la chiamata bloccata: non un tempo massimo per il task, che può durare quanto serve finché il modello risponde. Vuoto = 60 s. Allo scadere l\'app riprova o cambia modello.',
   color: 'Colore della console di questo template e del bordo tratteggiato delle sue istanze temporanee.',
   mainRadio: 'Rende questo template l’orchestratore: sarà l’unico a parlare con te e a delegare. Il precedente orchestratore torna worker.',
   notes: 'Istruzioni aggiunte sempre al prompt del solo orchestratore (lingua, stile, cosa evitare). I worker non le vedono: ricevono soltanto il TaskContract.',
@@ -526,14 +526,14 @@ export class SetupWizard {
     const b = a.budget;
     const bTok = h('input', { class: 'input num', type: 'number', min: '500', max: '60000', value: b ? String(b.maxTokens) : '', placeholder: '8000', title: T.budgetTok });
     const bTool = h('input', { class: 'input num', type: 'number', min: '1', max: '40', value: b ? String(b.maxToolCalls) : '', placeholder: '10', title: T.budgetTool });
-    const bSec = h('input', { class: 'input num', type: 'number', min: '10', max: '600', value: b ? String(b.maxSeconds) : '', placeholder: '180', title: T.budgetSec });
+    const bSec = h('input', { class: 'input num', type: 'number', min: '10', max: '300', value: b ? String(b.maxSeconds) : '', placeholder: '60', title: T.budgetSec });
     const syncBudget = () => {
       const t = Number(bTok.value);
       const c = Number(bTool.value);
       const s = Number(bSec.value);
       const any = bTok.value.trim() || bTool.value.trim() || bSec.value.trim();
       a.budget = any
-        ? { maxTokens: isFinite(t) && t ? t : 8000, maxToolCalls: isFinite(c) && c ? c : 10, maxSeconds: isFinite(s) && s ? s : 180 }
+        ? { maxTokens: isFinite(t) && t ? t : 8000, maxToolCalls: isFinite(c) && c ? c : 10, maxSeconds: isFinite(s) && s ? s : 60 }
         : null;
     };
     for (const el of [bTok, bTool, bSec]) el.addEventListener('input', syncBudget);

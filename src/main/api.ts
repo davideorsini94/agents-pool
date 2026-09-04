@@ -62,6 +62,9 @@ export interface StreamRequest {
   /** Wire format of this model; default 'chat'. Chosen by ModelRouter (PLAN-v2 §4, §5). */
   format?: ModelFormat;
   temperature?: number;
+  /** Silence tolerance for this call in ms — no SSE data at all for this long aborts it as a
+   *  retryable Network error (§ idle watchdog). Defaults to IDLE_TIMEOUT_MS when omitted. */
+  idleTimeoutMs?: number;
 }
 
 /**
@@ -283,7 +286,7 @@ export class OpenCodeClient {
       if (!res.ok) throw await httpError(res);
       if (!res.body) throw new ApiError('Protocol', 'Risposta senza corpo');
 
-      await readSse(res, controller, sse, (payload) => {
+      await readSse(res, controller, sse, req.idleTimeoutMs ?? IDLE_TIMEOUT_MS, (payload) => {
         let ev: unknown;
         try {
           ev = JSON.parse(payload);
@@ -327,7 +330,7 @@ export class OpenCodeClient {
         return (sse.sawDone && rawUsage && cost !== undefined) ? 'stop' : 'continue';
       });
     } catch (e) {
-      if (sse.idleTimedOut) throw new ApiError('Network', 'Nessuna risposta dal modello per 120 secondi');
+      if (sse.idleTimedOut) throw new ApiError('Network', `Nessuna risposta dal modello per ${Math.round((req.idleTimeoutMs ?? IDLE_TIMEOUT_MS) / 1000)} secondi`);
       const err = toApiError(e);
       // An abort we caused ourselves while waiting for the post-[DONE] cost chunk is not an error.
       if (!(sse.sawDone && err.type === 'Abort' && !signal.aborted)) throw err;
@@ -373,7 +376,7 @@ export class OpenCodeClient {
       if (!res.ok) throw await httpError(res);
       if (!res.body) throw new ApiError('Protocol', 'Risposta senza corpo');
 
-      await readSse(res, controller, sse, (payload) => {
+      await readSse(res, controller, sse, req.idleTimeoutMs ?? IDLE_TIMEOUT_MS, (payload) => {
         let ev: unknown;
         try {
           ev = JSON.parse(payload);
@@ -386,7 +389,7 @@ export class OpenCodeClient {
         return st.completed ? 'stop' : 'continue';
       });
     } catch (e) {
-      if (sse.idleTimedOut) throw new ApiError('Network', 'Nessuna risposta dal modello per 120 secondi');
+      if (sse.idleTimedOut) throw new ApiError('Network', `Nessuna risposta dal modello per ${Math.round((req.idleTimeoutMs ?? IDLE_TIMEOUT_MS) / 1000)} secondi`);
       const err = toApiError(e);
       if (!(st.completed && err.type === 'Abort' && !signal.aborted)) throw err;
     } finally {
@@ -430,13 +433,14 @@ export async function readSse(
   res: Response,
   controller: AbortController,
   state: SseState,
+  idleMs: number,
   onData: (payload: string) => SseDisposition,
 ): Promise<void> {
   let idleTimer: NodeJS.Timeout | null = null;
   let postDoneTimer: NodeJS.Timeout | null = null;
   const bumpIdle = (): void => {
     if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => { state.idleTimedOut = true; controller.abort(); }, IDLE_TIMEOUT_MS);
+    idleTimer = setTimeout(() => { state.idleTimedOut = true; controller.abort(); }, idleMs);
   };
   const reader = (res.body as ReadableStream<Uint8Array>).getReader();
   const decoder = new TextDecoder('utf-8');
@@ -467,7 +471,10 @@ export async function readSse(
     if (idleTimer) clearTimeout(idleTimer);
     if (postDoneTimer) clearTimeout(postDoneTimer);
     // The responses branch stops on `response.completed` without an abort: release the socket.
-    try { void reader.cancel(); } catch { /* already closed */ }
+    // `void` only swallows a SYNCHRONOUS throw; cancel() on a reader whose stream is already
+    // errored (e.g. we just errored it ourselves via an abort listener) rejects ASYNCHRONOUSLY, and
+    // an unhandled rejection crashes the whole process — so the promise itself needs its own catch.
+    try { reader.cancel().catch(() => { /* already closed/errored */ }); } catch { /* already closed */ }
   }
 }
 

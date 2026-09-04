@@ -29,8 +29,8 @@ import {
 const TIER_ORDER: Tier[] = ['T0', 'T1', 'T2', 'T3'];
 // Fallbacks when a template carries no budget. Sized on measured runs: a planner writing a 6-task
 // plan spends 10k+ tokens of reasoning before the JSON, a verifier reads several results.
-const PLANNER_BUDGET: Budget = { maxTokens: 20000, maxToolCalls: 8, maxSeconds: 240 };
-const VERIFIER_BUDGET: Budget = { maxTokens: 20000, maxToolCalls: 8, maxSeconds: 240 };
+const PLANNER_BUDGET: Budget = { maxTokens: 20000, maxToolCalls: 8, maxSeconds: 60 };
+const VERIFIER_BUDGET: Budget = { maxTokens: 20000, maxToolCalls: 8, maxSeconds: 60 };
 /** Requests whose artifact directories are kept on disk (§7.6). */
 const KEEP_ARTIFACT_REQUESTS = 20;
 

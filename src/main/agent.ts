@@ -275,14 +275,6 @@ export class AgentRuntime {
     const signal = this.abort.signal;
     deps.host.registerRun(run, this);
 
-    // Per-instance wall clock (PLAN-v2 §6.2): a kill turns the run into `partial`, never an error.
-    let budgetTimer: NodeJS.Timeout | null = null;
-    if (this.opts) {
-      budgetTimer = setTimeout(() => {
-        if (run.status === 'running') { run.budgetHit = 'maxSeconds'; this.abort?.abort(); }
-      }, this.opts.budget.maxSeconds * 1000);
-    }
-
     bus.emit(this.id, runId, {
       kind: 'task_start',
       origin: task.origin,
@@ -350,6 +342,11 @@ export class AgentRuntime {
                 sessionId: requestId,
                 ...(maxTokens !== undefined ? { maxTokens } : {}),
                 ...(liveAgent.temperature !== undefined ? { temperature: liveAgent.temperature } : {}),
+                // `budget.maxSeconds` is silence tolerance, not a wall clock for the whole run: while
+                // the model keeps streaming, nothing is timed against it at all. A worker with several
+                // legitimate iterations no longer dies mid-work just because its total elapsed time
+                // crossed a fixed ceiling — only real silence from the model does.
+                ...(this.opts ? { idleTimeoutMs: this.opts.budget.maxSeconds * 1000 } : {}),
               },
               this.handlers(runId, iteration, () => acc, callUsage, run),
               signal,
@@ -502,7 +499,6 @@ export class AgentRuntime {
         }
       }
     } finally {
-      if (budgetTimer) clearTimeout(budgetTimer);
       bus.flushAgent(this.id);
     }
 

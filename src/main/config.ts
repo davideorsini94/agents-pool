@@ -35,25 +35,25 @@ export const RECOMMENDED_POOL: AgentInput[] = [
   {
     name: 'Planner', role: 'planner', model: 'glm-5.3',
     fallbacks: ['kimi-k2.7-code', 'minimax-m3'],
-    budget: { maxTokens: 16000, maxToolCalls: 8, maxSeconds: 180 },
+    budget: { maxTokens: 16000, maxToolCalls: 8, maxSeconds: 60 },
     prompt: DEFAULT_PROMPTS.planner, color: '#8B5CF6',
   },
   {
     name: 'Worker', role: 'worker', model: 'deepseek-v4-flash',
     fallbacks: ['kimi-k2.7-code', 'glm-5.3-flash'], escalation: 'deepseek-v4-pro',
-    budget: { maxTokens: 24000, maxToolCalls: 12, maxSeconds: 240 },
+    budget: { maxTokens: 24000, maxToolCalls: 12, maxSeconds: 60 },
     prompt: DEFAULT_PROMPTS.worker, color: '#10B981',
   },
   {
     name: 'Worker Flash', role: 'worker', model: 'longcat-2.0',
     fallbacks: ['glm-5.3-flash', 'hy3'],
-    budget: { maxTokens: 12000, maxToolCalls: 8, maxSeconds: 150 },
+    budget: { maxTokens: 12000, maxToolCalls: 8, maxSeconds: 60 },
     prompt: DEFAULT_PROMPTS.worker, color: '#F59E0B',
   },
   {
     name: 'Verificatore', role: 'verifier', model: 'qwen3.7-plus',
     fallbacks: ['minimax-m3', 'glm-5.3-flash'], escalation: 'glm-5.3',        // escalation: critical only
-    budget: { maxTokens: 16000, maxToolCalls: 8, maxSeconds: 180 },
+    budget: { maxTokens: 16000, maxToolCalls: 8, maxSeconds: 60 },
     prompt: DEFAULT_PROMPTS.verifier, color: '#EF4444',
   },
 ];

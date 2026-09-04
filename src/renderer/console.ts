@@ -540,7 +540,7 @@ export class ConsoleView {
       + '\nÈ l’orchestratore a scegliere il livello: più alto = più istanze e più token spesi.';
   }
 
-  /** Ephemeral budget line: `tok 3.1k/8k · strumenti 2/10 · 41 s/180 s`. */
+  /** Ephemeral budget line: `tok 3.1k/8k · strumenti 2/10 · 41 s (timeout silenzio 60 s)`. */
   private renderBudget(): void {
     if (this.budgetEl.hidden) return;
     const elapsedMs = this.budgetElapsed || Date.now() - this.budgetStart;
@@ -548,14 +548,15 @@ export class ConsoleView {
     let text = fmtBudget(this.lastUsage ?? undefined, this.budget ?? undefined, { toolCalls, elapsedMs });
     if (this.budgetHit) text += ' · budget ' + (BUDGET_HIT_LABEL[this.budgetHit] ?? this.budgetHit) + ' esaurito';
     this.budgetText.textContent = text;
-    // The bar tracks whichever of the three limits is closest to being spent.
+    // The bar tracks token/tool-call consumption only: unlike those two, maxSeconds is not a
+    // cumulative ceiling the elapsed time counts against — it only fires on real model silence — so
+    // it plays no part in "how close to being stopped" this instance is.
     let ratio = 0;
     if (this.budget) {
       const tok = (this.lastUsage?.promptTokens ?? 0) + (this.lastUsage?.completionTokens ?? 0);
       ratio = Math.max(
         this.budget.maxTokens > 0 ? tok / this.budget.maxTokens : 0,
         this.budget.maxToolCalls > 0 ? toolCalls / this.budget.maxToolCalls : 0,
-        this.budget.maxSeconds > 0 ? elapsedMs / 1000 / this.budget.maxSeconds : 0,
       );
     }
     this.budgetBar.style.setProperty('width', Math.min(100, Math.round(ratio * 100)) + '%');

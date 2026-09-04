@@ -33,9 +33,13 @@ export const POOL_RANGES: PoolRanges = {
 // Measured on real runs: one file write costs 4.7k-7.1k tokens because every iteration re-sends
 // (and re-counts) the prompt, so a budget of 8k killed ordinary tasks halfway. These defaults leave
 // room for a 4-6 iteration task; the user can lower them per template in Settings.
-export const DEFAULT_BUDGET: Budget = { maxTokens: 24000, maxToolCalls: 12, maxSeconds: 240 };
+// `maxSeconds` is NOT a wall clock for the whole task: it is how long the model may go silent
+// (no streamed data at all) before a call is treated as stalled and retried/switched. A task with
+// several legitimate iterations can run far longer than this in total as long as the model keeps
+// responding — only real silence counts against it.
+export const DEFAULT_BUDGET: Budget = { maxTokens: 24000, maxToolCalls: 12, maxSeconds: 60 };
 /** Ceiling no contract or template can exceed (§7.1). */
-export const HARD_MAX_BUDGET: Budget = { maxTokens: 60000, maxToolCalls: 40, maxSeconds: 600 };
+export const HARD_MAX_BUDGET: Budget = { maxTokens: 60000, maxToolCalls: 40, maxSeconds: 300 };
 
 export function clampRange(raw: unknown, r: Range): number {
   return clampInt(raw, r.min, r.max, r.default);

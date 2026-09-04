@@ -142,7 +142,7 @@ const T = {
   resetAll: 'Cancella template, cronologie e impostazioni e riapre la procedura guidata. La API key resta salvata.',
 };
 
-const DEFAULT_BUDGET: Budget = { maxTokens: 8000, maxToolCalls: 10, maxSeconds: 180 };
+const DEFAULT_BUDGET: Budget = { maxTokens: 24000, maxToolCalls: 12, maxSeconds: 60 };
 
 const FMT_HELP: Record<ModelFormat, string> = {
   chat: 'Endpoint /chat/completions: il formato usato dalla maggior parte dei modelli.',
@@ -501,8 +501,10 @@ export class SettingsPanel {
       title: 'Numero massimo di chiamate a strumenti per istanza: al superamento l’istanza chiude con esito parziale.',
     });
     const bSec = h('input', {
-      class: 'input num', type: 'number', min: '10', max: '600', value: f.budget.maxSeconds, placeholder: String(DEFAULT_BUDGET.maxSeconds),
-      title: 'Tempo massimo per istanza: allo scadere viene fermata con esito parziale. Alzarlo aiuta i task lunghi ma allunga anche quelli sbagliati.',
+      class: 'input num', type: 'number', min: '10', max: '300', value: f.budget.maxSeconds, placeholder: String(DEFAULT_BUDGET.maxSeconds),
+      title: 'Secondi di silenzio dal modello prima di considerare la chiamata bloccata (non un tempo massimo per il task: mentre il modello '
+        + 'risponde, anche a fasi, non c\'è alcun conteggio). Allo scadere l\'app riprova automaticamente o cambia modello; alzalo solo se usi un '
+        + 'modello lento a iniziare a rispondere.',
     });
     bTok.addEventListener('input', () => { f.budget.maxTokens = bTok.value; });
     bTool.addEventListener('input', () => { f.budget.maxToolCalls = bTool.value; });
@@ -518,12 +520,12 @@ export class SettingsPanel {
       this.field('Token', bTok), this.field('Strumenti', bTool), this.field('Secondi', bSec));
     const budgetBox = h('div', {
       class: 'field', hidden: f.role === 'orchestrator',
-      title: 'Tre tetti per ogni istanza di questo template: al primo raggiunto l’istanza viene fermata e consegna quello '
-        + 'che ha prodotto. Budget bassi costano poco ma producono più risultati parziali.',
+      title: 'Token e strumenti sono tetti cumulativi: al primo raggiunto l’istanza viene fermata e consegna quello che ha prodotto. '
+        + 'I secondi invece sono una tolleranza al silenzio del modello (si riprova o si cambia modello), non un tempo massimo per il task.',
     },
     h('span', { class: 'lbl', text: 'Budget per task' }),
     budgetRow,
-    h('span', { class: 'hint', text: 'Vuoto = predefinito del pool (' + DEFAULT_BUDGET.maxTokens + ' token / ' + DEFAULT_BUDGET.maxToolCalls + ' strumenti / ' + DEFAULT_BUDGET.maxSeconds + ' s). Superato il budget l’istanza chiude con esito parziale.' }));
+    h('span', { class: 'hint', text: 'Vuoto = predefinito del pool (' + DEFAULT_BUDGET.maxTokens + ' token / ' + DEFAULT_BUDGET.maxToolCalls + ' strumenti / ' + DEFAULT_BUDGET.maxSeconds + ' s di silenzio massimo). Token/strumenti esauriti chiudono l’istanza con esito parziale; il silenzio prolungato fa solo ritentare o cambiare modello.' }));
     const concBox = h('div', { hidden: f.role === 'orchestrator' },
       this.field('Istanze parallele max', conc, 'Vuoto = come il pool (Worker paralleli per chiamata).', T.formConc));
 

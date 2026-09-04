@@ -297,6 +297,77 @@ check('token details normalized', off.usage?.promptTokens === 11 && off.usage?.c
 check('cost chunk after [DONE] is captured', off.usage?.cost === 0.0042, String(off.usage?.cost));
 check('usage reported exactly once, not estimated', off.usage?.calls === 1 && off.usage?.estimated === false);
 
+// ---------------------------------------------------------------- 6b. idle-timeout watchdog
+// `idleTimeoutMs` (== budget.maxSeconds * 1000) must only fire on real silence — a slow-but-live
+// stream must run to completion no matter how long it takes in total.
+{
+  const realFetch2 = globalThis.fetch;
+  let slowStopped = false;
+  const slowButAlive = async () => new Response(new ReadableStream({
+    start(controller) {
+      const enc = new TextEncoder();
+      // Three chunks, 40ms apart — well under a 150ms idle window — so the stream is always "alive"
+      // even though the whole call takes 120ms, longer than a hypothetical 1s *total* budget would
+      // have tolerated under the old (removed) wall-clock kill.
+      const chunks = [
+        'data: {"choices":[{"index":0,"delta":{"content":"a"}}]}\n\n',
+        'data: {"choices":[{"index":0,"delta":{"content":"b"}}]}\n\n',
+        'data: {"choices":[{"index":0,"finish_reason":"stop","delta":{}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\n' +
+          'data: [DONE]\n\ndata: {"choices":[],"cost":"0"}\n\n',
+      ];
+      let i = 0;
+      const step = () => {
+        if (slowStopped) return;
+        if (i >= chunks.length) { try { controller.close(); } catch { /* already closed */ } return; }
+        try { controller.enqueue(enc.encode(chunks[i++])); } catch { return; }
+        setTimeout(step, 40);
+      };
+      step();
+    },
+    cancel() { slowStopped = true; },
+  }), { status: 200, headers: { 'content-type': 'text/event-stream' } });
+  globalThis.fetch = slowButAlive;
+  const alive = { text: '' };
+  const aliveRes = await client.streamChat(
+    { model: MODEL, sessionId: 'idle-alive', messages: [{ role: 'user', content: 'hi' }], idleTimeoutMs: 150 },
+    { onReasoning: () => {}, onText: (t) => { alive.text += t; }, onToolCallDelta: () => {}, onUsage: () => {} },
+    new AbortController().signal,
+  );
+  check('a slow-but-live stream (gaps under the idle window) completes normally',
+    alive.text === 'ab' && aliveRes.finishReason === 'stop', JSON.stringify({ text: alive.text, finishReason: aliveRes.finishReason }));
+
+  // A real fetch() ties the response body's reader to the request's AbortSignal, so when the idle
+  // watchdog calls controller.abort(), the pending reader.read() rejects and readSse can react. This
+  // fake stream never closes on its own (matching a genuinely stalled connection) so it must be wired
+  // to the signal by hand, or the test would hang forever instead of proving the watchdog fires.
+  const staysSilent = async (_url, init) => new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('data: {"choices":[{"index":0,"delta":{"content":"only "}}]}\n\n'));
+      init?.signal?.addEventListener('abort', () => {
+        try { controller.error(new DOMException('Aborted', 'AbortError')); } catch { /* already closed */ }
+      }, { once: true });
+    },
+  }), { status: 200, headers: { 'content-type': 'text/event-stream' } });
+  globalThis.fetch = staysSilent;
+  const t0 = Date.now();
+  let idleErr = null;
+  try {
+    await client.streamChat(
+      { model: MODEL, sessionId: 'idle-stall', messages: [{ role: 'user', content: 'hi' }], idleTimeoutMs: 120 },
+      { onReasoning: () => {}, onText: () => {}, onToolCallDelta: () => {}, onUsage: () => {} },
+      new AbortController().signal,
+    );
+  } catch (e) { idleErr = e; }
+  const waited = Date.now() - t0;
+  check('a genuinely silent stream is aborted as a retryable Network error',
+    idleErr?.type === 'Network' && idleErr?.retryable === true, String(idleErr?.type));
+  check('it fires close to the configured idle window, not a fixed 120s',
+    waited >= 120 && waited < 2000, `${waited}ms`);
+  check('the error message names the configured window', /120 secondi/.test(idleErr?.message ?? '') === false
+    && /\d+ secondi/.test(idleErr?.message ?? ''), String(idleErr?.message));
+  globalThis.fetch = realFetch2;
+}
+
 
 // ---------------------------------------------------------------- 7. Responses SSE parser
 
@@ -939,12 +1010,21 @@ function task(id, role, objective, sideEffects = false) {
   fs.rmSync(H.root, { recursive: true, force: true });
 }
 {
+  // The pool-level fake `streamChat` is a black box that resolves once after `latencyMs` (it does
+  // not stream incrementally), so it cannot exercise the idle-*watchdog* itself — that is covered
+  // above with a real synthetic SSE stream. What belongs here is the regression this whole fix is
+  // about: a task whose single model call legitimately takes longer than `maxSeconds` (but DOES
+  // return, i.e. the model was never silent) must not be killed by it. `maxSeconds` used to be a
+  // wall clock for the whole run; a worker with several such calls would cross it while genuinely
+  // working and die mid-task with no deliverable — exactly what was reported.
   const H = harness({ latencyMs: 1500 });
   H.cfg.agents.find((a) => a.id === 'a_wk').budget = { maxTokens: 60000, maxToolCalls: 10, maxSeconds: 1 };
   const out = JSON.parse(await H.pool.delegateTasks(H.from, { tier: 'T1', tasks: [task('s1', 'Worker', 'Esegui un lavoro lento e riassumilo.')] }, 'c'));
-  check('maxSeconds kill returns partial', out.results[0].status === 'partial', JSON.stringify(out.results[0]).slice(0, 160));
+  check('a slow-but-responding call is not killed by maxSeconds (no wall clock on the whole run)',
+    out.results[0].status === 'ok', JSON.stringify(out.results[0]).slice(0, 160));
   const endEv = H.state.getConsole('a_wk#s1', { limit: 100 }).find((e) => e.kind === 'task_end');
-  check('task_end reports budgetHit=maxSeconds', endEv?.budgetHit === 'maxSeconds', String(endEv?.budgetHit));
+  check('task_end never reports budgetHit=maxSeconds from elapsed wall-clock time',
+    endEv?.budgetHit !== 'maxSeconds', String(endEv?.budgetHit));
   // Only completion tokens are charged against the answer allowance: charging the (re-sent) prompt
   // collapsed it to the floor after a couple of iterations and truncated every later reply.
   check('max_tokens per call is derived from completion tokens only, never below the floor',

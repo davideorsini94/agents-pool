@@ -297,7 +297,10 @@ export function modelBadges(m: ModelInfo | undefined | null, role?: AgentRole): 
   return out.filter((x): x is HTMLElement => x !== null);
 }
 
-/** `tok 3.1k/8k · strumenti 2/10 · 41 s/180 s` — u = live usage, b = budget, s = counters. */
+/** `tok 3.1k/8k · strumenti 2/10 · 41 s (timeout silenzio 60 s)` — u = live usage, b = budget, s = counters.
+ *  The seconds figure is elapsed wall-clock (informational): unlike tokens/tool-calls it is not a
+ *  cumulative budget the instance is stopped at — `b.maxSeconds` only fires if the MODEL goes silent
+ *  for that long, so an instance can legitimately run well past it while the model keeps responding. */
 export function fmtBudget(
   u: Usage | undefined,
   b: Budget | undefined,
@@ -308,7 +311,7 @@ export function fmtBudget(
   return [
     'tok ' + fmtTokens(tok) + (b ? '/' + fmtTokens(b.maxTokens) : ''),
     'strumenti ' + s.toolCalls + (b ? '/' + b.maxToolCalls : ''),
-    secs + ' s' + (b ? '/' + b.maxSeconds + ' s' : ''),
+    secs + ' s' + (b ? ' (timeout silenzio ' + b.maxSeconds + ' s)' : ''),
   ].join(' · ');
 }
 
