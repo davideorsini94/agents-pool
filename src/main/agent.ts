@@ -30,6 +30,21 @@ const POOL_TOOLS = new Set(['delegate_tasks', 'run_planner', 'run_verifier', 're
 const MIN_CALL_TOKENS = 4096;
 const MAX_CALL_TOKENS = 16384;
 
+/**
+ * A turn that ends with text and no tool call is normally the final answer — but not when the model
+ * only *announced* the action it never performed. Measured: the orchestrator reasoned at length,
+ * wrote "lancio subito 3 task paralleli" and stopped, so the request ended with nothing done and no
+ * error. These phrasings (it/en) mean "I am about to act", so the loop asks for the call instead of
+ * accepting the announcement as an answer.
+ */
+const ANNOUNCED_ACTION_RE =
+  /\b(lancio|procedo|delego|scompongo|adesso (?:chiamo|delego|creo|lancio)|ora (?:chiamo|delego|creo|lancio)|sto per|vado a|parto con|eseguo subito)\b|\b(?:i'?ll|i am going to|i'?m going to|let me|about to|now) (?:call|delegate|launch|spawn|dispatch|create|write|start)\b|\bwriting the call\b|\blaunching\b/i;
+/** Two nudges per run: enough for a stall, far from an infinite ping-pong. */
+const MAX_TOOL_NUDGES = 2;
+const NUDGE_TEXT = 'Non hai emesso nessuna chiamata a strumenti: il tuo messaggio annunciava un\'azione senza eseguirla, '
+  + 'oppure si è interrotto a metà. Se volevi delegare o usare uno strumento, emetti ORA la chiamata (nient\'altro). '
+  + 'Se invece il lavoro è concluso, scrivi la risposta finale completa per l\'utente.';
+
 /** What the runtime needs from the orchestrator (implemented by Orchestrator). */
 export interface AgentHost extends OrchestratorApi {
   roster(): AgentView[];
@@ -290,6 +305,7 @@ export class AgentRuntime {
     let finalText = '';
     let lastText = '';
     let iterations = 0;
+    let nudges = 0;
     let errorMessage: string | null = null;
     let lastModel = this.cfg().model;
 
@@ -458,6 +474,22 @@ export class AgentRuntime {
         this.emitStatus();
 
         if (!calls.length) {
+          // A cut-off reply is incomplete by definition, and an announced-but-not-performed action
+          // is not an answer either: ask for the call instead of ending the run on it.
+          const truncatedTurn = finishReason === 'length';
+          const announcedOnly = ANNOUNCED_ACTION_RE.test(acc.text);
+          if (tools.length && nudges < MAX_TOOL_NUDGES && !run.budgetHit && (truncatedTurn || announcedOnly)) {
+            nudges += 1;
+            this.push({ role: 'user', content: NUDGE_TEXT });
+            bus.emit(this.id, runId, {
+              kind: 'info',
+              message: truncatedTurn
+                ? 'Risposta interrotta senza chiamare strumenti: chiedo di completarla.'
+                : 'Azione annunciata ma nessuno strumento chiamato: chiedo di eseguirla.',
+            });
+            this.setStatus('thinking', 'richiesta di completare l\'azione');
+            continue;
+          }
           if (acc.textEvId) bus.patch(this.id, acc.textEvId, { set: { final: true } });
           run.status = run.budgetHit ? 'partial' : 'done';
           finalText = acc.text;

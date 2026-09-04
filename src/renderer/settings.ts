@@ -1070,7 +1070,8 @@ export class SettingsPanel {
     const main = s.agents.find((a) => a.id === s.mainAgentId);
     return this.section('Dati', T.sectData,
       main ? btn('Cancella cronologia di ' + main.name, () => void this.clearHistory(main), 'btn ghost wide', T.clearHistory) : null,
-      h('div', { class: 'hint', text: 'Solo l’orchestratore ha una cronologia: planner, worker e verificatori partono sempre da zero.' }),
+      h('div', { class: 'hint', text: 'Ogni console ha il suo pulsante 🧠 per azzerare la memoria di quell’agente. Solo l’orchestratore '
+        + 'conserva una conversazione tra una richiesta e l’altra: planner, worker e verificatori partono già da zero a ogni task.' }),
       btn('Reset totale', () => void this.resetAll(), 'btn danger wide', T.resetAll),
       h('div', { class: 'hint', text: 'Il reset cancella template, cronologie e impostazioni (la API key resta) e riapre la procedura guidata.' }));
   }

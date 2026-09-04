@@ -268,16 +268,25 @@ export class Orchestrator implements AgentHost {
 
   // ------------------------------------------------------------ misc
 
+  /**
+   * Every template gets this, not just the orchestrator (each console has its own button). Only the
+   * orchestrator carries a conversation across requests, so for the other roles this resets the
+   * prompt-cache session and says so plainly instead of refusing: their instances already start
+   * from an empty context at every task.
+   */
   clearHistory(agentId: AgentId): void {
     const a = this.deps.config.agent(agentId);
     if (!a) throw new Error('Agente inesistente');
-    if (roleOf(a) !== 'orchestrator') {
-      throw new Error('Solo l\'orchestratore ha una cronologia: le istanze partono sempre da zero');
-    }
-    const rt = this.runtimes.get(agentId);
-    if (rt?.busy) throw new Error('L\'agente è al lavoro: fermalo prima di cancellare la cronologia');
+    const rt = this.runtimes.get(agentId) ?? this.pool.liveRuntime(agentId);
+    if (rt?.busy) throw new Error('L\'agente è al lavoro: fermalo prima di azzerarne la memoria');
+    const hadHistory = this.deps.state.history(agentId).length > 0;
     this.deps.state.clearHistory(agentId);
-    this.deps.bus.emit(agentId, null, { kind: 'info', message: 'Cronologia cancellata: nuova sessione' });
+    this.deps.bus.emit(agentId, null, {
+      kind: 'info',
+      message: hadHistory
+        ? 'Cronologia cancellata: nuova sessione'
+        : 'Nuova sessione: questo template non conserva conversazione (ogni istanza parte da zero)',
+    });
   }
 
   snapshot(): RuntimeSnapshot {

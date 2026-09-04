@@ -997,6 +997,40 @@ function task(id, role, objective, sideEffects = false) {
   fs.rmSync(H.root, { recursive: true, force: true });
 }
 
+// 12.4b announced-but-not-performed action: the turn must not be accepted as the final answer
+{
+  // First turn: plain text announcing an action, no tool call at all — measured in the wild as an
+  // orchestrator writing "lancio subito 3 task paralleli" and stopping, so the request ended with
+  // nothing done. The loop must ask for the call instead and let the agent finish on the next turn.
+  // Count by call order, not by task_id: the nudge appends a user message, so the harness's
+  // "last user message" heuristic can no longer recognise the task on later turns.
+  let turn = 0;
+  const H = harness({ script: () => {
+    turn += 1;
+    if (turn === 1) return { text: 'Ok, procedo: lancio subito 3 task paralleli con file piccoli.' };
+    return { text: '{"task_id":"n1","status":"ok","result":"fatto","assumptions":[],"unverified":[],"blocking_question":null}' };
+  } });
+  const out = JSON.parse(await H.pool.delegateTasks(H.from, { tier: 'T1', tasks: [task('n1', 'Worker', 'Crea i tre file richiesti nel workspace.')] }, 'c'));
+  check('an announced-but-not-performed action does not end the run', turn >= 2, `model turns=${turn}`);
+  check('after the nudge the agent delivers its result', out.results[0].status === 'ok', JSON.stringify(out.results[0]).slice(0, 140));
+  const info = H.state.getConsole('a_wk#n1', { limit: 100 })
+    .filter((e) => e.kind === 'info' && /nessuno strumento chiamato/i.test(e.message || ''));
+  check('the nudge is visible on the console, and bounded', info.length >= 1 && info.length <= 2, `info events=${info.length}`);
+  await H.contracts.flush();
+  fs.rmSync(H.root, { recursive: true, force: true });
+}
+
+// 12.4c a plain final answer is still accepted immediately (the nudge must not fire on everything)
+{
+  let qTurns = 0;
+  const H = harness({ script: () => { qTurns += 1; return { text: '{"task_id":"q1","status":"ok","result":"tre file elencati","assumptions":[],"unverified":[],"blocking_question":null}' }; } });
+  const out = JSON.parse(await H.pool.delegateTasks(H.from, { tier: 'T1', tasks: [task('q1', 'Worker', 'Elenca i file della cartella di lavoro.')] }, 'c'));
+  check('a normal final answer is not nudged', qTurns === 1, `model turns=${qTurns}`);
+  check('the normal answer is returned as ok', out.results[0].status === 'ok', JSON.stringify(out.results[0]).slice(0, 120));
+  await H.contracts.flush();
+  fs.rmSync(H.root, { recursive: true, force: true });
+}
+
 // 12.5 budgets: tool calls and wall clock
 {
   const H = harness({ script: () => ({ toolCall: { name: 'list_directory', args: { path: '.' } } }) });

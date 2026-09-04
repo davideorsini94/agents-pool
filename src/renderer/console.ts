@@ -423,9 +423,10 @@ export class ConsoleView {
         iconBtn('⤢', maxTitle, () => this.host.toggleMaximize(this.agent.id)),
         iconBtn('▁', 'Riduce la console a una scheda nella barra in basso: continua a ricevere eventi e mostra il numero di quelli non visti.',
           () => this.host.toggleCollapse(this.agent.id)),
-        iconBtn('⌫', 'Cancella gli eventi mostrati qui e il loro log su disco. Non cancella la memoria della conversazione '
-          + '(quella si azzera da Impostazioni → Dati).',
+        iconBtn('⌫', 'Cancella gli eventi mostrati qui e il loro log su disco. Non tocca la memoria della conversazione: '
+          + 'per quella usa il pulsante 🧠 qui accanto.',
           () => void this.clearRemote()),
+        iconBtn('🧠', this.memoryTitle(), () => void this.clearMemory()),
       ];
 
     const head = h('div', { class: 'cons-head' },
@@ -629,6 +630,25 @@ export class ConsoleView {
       return;
     }
     this.clearDom();
+  }
+
+  /** Role-aware, because only the orchestrator carries a conversation between requests. */
+  private memoryTitle(): string {
+    return roleOf(this.agent) === 'orchestrator'
+      ? 'Azzera la memoria di questo agente: la conversazione viene cancellata e la prossima richiesta '
+        + 'parte senza ricordo delle precedenti (i token di contesto tornano a zero). Non si può annullare, '
+        + 'e non funziona mentre l’agente sta lavorando.'
+      : 'Azzera la memoria di questo agente. Questo template non conserva una conversazione — ogni sua istanza '
+        + 'parte già da contesto vuoto a ogni task — quindi qui il pulsante apre solo una nuova sessione '
+        + '(cache dei prompt ripartita da zero).';
+  }
+
+  private async clearMemory(): Promise<void> {
+    try {
+      await window.api.invoke('agent:clearHistory', this.agent.id);
+    } catch (e) {
+      toast('error', errText(e));
+    }
   }
 
   clearDom(): void {
