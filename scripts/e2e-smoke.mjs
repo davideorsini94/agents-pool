@@ -470,9 +470,15 @@ try {
     const evs = (await events(mainId)).slice(before);
     const every = await allEvents();
     check('no verifier: run completes', evs.some(e => e.kind === 'task_end'), '');
-    check('no verifier: run_verifier never called in this request',
-      !evs.some(e => e.kind === 'tool_call' && e.name === 'run_verifier'),
-      evs.filter(e => e.kind === 'tool_call').map(e => e.name).join(',') || 'no tool calls');
+    // The tool is not exposed without a verifier template, but a model can still call it from memory:
+    // what must hold is that no verifier RUNS and that the call is refused with an explanation.
+    const vCalls = evs.filter(e => e.kind === 'tool_call' && e.name === 'run_verifier');
+    check('no verifier: no verdict was produced', !every.some(e => e.kind === 'verdict' && e.ts >= (evs[0]?.ts || 0)), '');
+    if (vCalls.length) {
+      check('no verifier: a hallucinated run_verifier call is refused with an explanation',
+        vCalls.every(t => /no verifier template|verify inline|nessun template/i.test(String(t.result?.output || ''))),
+        vCalls.map(t => `${t.status}:${String(t.result?.output || '').slice(0, 60)}`).join(' | '));
+    } else soft('no verifier: the model did not even try to call run_verifier', true, '');
     check('no verifier: no error event on the orchestrator', !evs.some(e => e.kind === 'error'), evs.filter(e => e.kind === 'error').map(e => e.message).join(' | '));
     const both = ['uno.txt', 'due.txt'].filter(f => fs.existsSync(path.join(workspace, f)));
     soft('no verifier: both files written', both.length === 2, `created=${both.join(',')}`);
