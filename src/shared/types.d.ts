@@ -149,7 +149,7 @@ export interface InvokeMap {                                        // renderer 
   'console:getEvents':      (agentId: AgentId, opts: { beforeSeq?: number; limit: number }) => ConsoleEvent[];  // ascending by seq
   'console:clear':          (agentId: AgentId) => void;                     // clears log only, not history
   'runtime:getSnapshot':    () => RuntimeSnapshot;
-  'permission:respond':     (requestId: string, decision: PermissionDecision) => void;   // unknown id → no-op
+  'permission:respond':     (requestId: string, decision: PermissionDecision, pattern?: string) => void;   // unknown id → no-op; pattern = user-edited session pattern (optional)
   'askUser:respond':        (requestId: string, answer: string | null) => void;          // null = dismissed
   'shell:openPath':         (p: string) => void;                            // only workspacePath or its children
 }
