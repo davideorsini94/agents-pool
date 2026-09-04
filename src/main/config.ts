@@ -4,9 +4,10 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { safeStorage } from 'electron';
 import type {
-  AgentConfig, AgentId, AgentInput, AgentView, AppConfig, ConfigChanged,
-  ConfigPatch, ConfigSnapshot, PermissionMode, SetupPayload,
+  AgentConfig, AgentId, AgentInput, AgentView, AppConfig, Budget, ConfigChanged,
+  ConfigPatch, ConfigSnapshot, ModelFormat, ModelPrivacy, PermissionMode, PoolRanges, SetupPayload,
 } from '../shared/types';
+import { DEFAULT_PROMPTS } from './prompt';
 import {
   PALETTE, atomicWriteSync, isRecord, log, logWarn, maskKey, newAgentId, readJsonSync,
 } from './util';
@@ -15,6 +16,152 @@ export { PALETTE };
 export const DEFAULT_MODEL = 'deepseek-v4-flash';
 export const PROBE_MODEL = 'glm-5.3-flash';
 export const DEFAULT_MAX_ITERATIONS = 40;
+
+// ---------------------------------------------------------------------------------------------
+// v2 shared constants (PLAN-v2 §11.3). Data only: the ConfigStore below is still v1 —
+// TODO(v2-A): version 2 migration, POOL_RANGES clamps, per-template maxConcurrent, the role
+// invariant (exactly one orchestrator) and the removal of the 10-agent cap (§11.1, §11.2).
+// ---------------------------------------------------------------------------------------------
+
+/** Pool limits are settings, not constants: `default` reproduces the lead's design, the UI warns
+ *  above `recommendedMax` and clamps to [min, max]. Exposed as `AppInfo.poolRanges`. */
+export const POOL_RANGES: PoolRanges = {
+  maxParallelWorkers:     { min: 1,    max: 16,    default: 4,    recommendedMax: 8 },
+  maxWorkersPerRequest:   { min: 1,    max: 32,    default: 8,    recommendedMax: 8 },
+  correctionRounds:       { min: 0,    max: 3,     default: 1,    recommendedMax: 1 },
+  maxDepth:               { min: 2,    max: 4,     default: 2,    recommendedMax: 2 },   // only with allowWorkerDelegation
+  artifactThresholdChars: { min: 1000, max: 20000, default: 4000, recommendedMax: 8000 },
+};
+
+/** Per-task budget when neither the TaskContract nor the template sets one (§11.3). */
+export const DEFAULT_BUDGET: Budget = { maxTokens: 8000, maxToolCalls: 10, maxSeconds: 180 };
+
+/** Wizard preset "Pool consigliato" — a preset, not a schema: quota buckets are per model, so each
+ *  role sits on a different bucket and every primary was verified for its exact job (§11.3). */
+export const RECOMMENDED_POOL: AgentInput[] = [
+  {
+    name: 'Orchestratore', role: 'orchestrator', model: 'minimax-m3',
+    fallbacks: ['qwen3.7-plus', 'deepseek-v4-flash'], escalation: 'glm-5.3',   // escalation: T3 only
+    prompt: DEFAULT_PROMPTS.orchestrator, color: '#3B82F6', maxIterations: DEFAULT_MAX_ITERATIONS,
+  },
+  {
+    name: 'Planner', role: 'planner', model: 'glm-5.3',
+    fallbacks: ['kimi-k2.7-code', 'minimax-m3'],
+    budget: { maxTokens: 6000, maxToolCalls: 6, maxSeconds: 120 },
+    prompt: DEFAULT_PROMPTS.planner, color: '#8B5CF6',
+  },
+  {
+    name: 'Worker', role: 'worker', model: 'deepseek-v4-flash',
+    fallbacks: ['kimi-k2.7-code', 'glm-5.3-flash'], escalation: 'deepseek-v4-pro',
+    budget: { maxTokens: 8000, maxToolCalls: 10, maxSeconds: 180 },
+    prompt: DEFAULT_PROMPTS.worker, color: '#10B981',
+  },
+  {
+    name: 'Worker Flash', role: 'worker', model: 'longcat-2.0',
+    fallbacks: ['glm-5.3-flash', 'hy3'],
+    budget: { maxTokens: 4000, maxToolCalls: 6, maxSeconds: 120 },
+    prompt: DEFAULT_PROMPTS.worker, color: '#F59E0B',
+  },
+  {
+    name: 'Verificatore', role: 'verifier', model: 'qwen3.7-plus',
+    fallbacks: ['minimax-m3', 'glm-5.3-flash'], escalation: 'glm-5.3',        // escalation: critical only
+    budget: { maxTokens: 8000, maxToolCalls: 8, maxSeconds: 150 },
+    prompt: DEFAULT_PROMPTS.verifier, color: '#EF4444',
+  },
+];
+
+const ECONOMY_MODEL = 'muse-spark-1.3-contributor';
+
+/** Wizard preset "Pool economico (Muse Spark)" — RECOMMENDED_POOL with both worker templates on
+ *  `muse-spark-1.3-contributor` so a 403 self-heals through the router chain. Cheapest and by far
+ *  the largest allowance, but it needs the OpenCode workspace opt-in AND its prompts/completions
+ *  train Meta models: never a default, never for proprietary or clinical content (§11.3). */
+export const ECONOMY_POOL: AgentInput[] = RECOMMENDED_POOL.map((t) => {
+  if (t.name === 'Worker') return { ...t, model: ECONOMY_MODEL, fallbacks: ['deepseek-v4-flash', 'kimi-k2.7-code'] };
+  if (t.name === 'Worker Flash') return { ...t, model: ECONOMY_MODEL, fallbacks: ['longcat-2.0', 'glm-5.3-flash'] };
+  return { ...t };
+});
+
+/** Wizard preset "Vuoto" — the single invariant of a pool: one orchestrator (§11.3). */
+export const EMPTY_POOL: AgentInput[] = [
+  {
+    name: 'Orchestratore', role: 'orchestrator', model: 'minimax-m3', fallbacks: ['qwen3.7-plus'],
+    prompt: DEFAULT_PROMPTS.orchestrator, color: '#3B82F6', maxIterations: DEFAULT_MAX_ITERATIONS,
+  },
+];
+
+/** One row of MODEL_TABLE: measured facts models.dev does not carry. Price/context from models.dev
+ *  win when present; unknown ids default to `chat` / `zdr` with no badges (§1 api.ts, §11.3). */
+export interface ModelTableEntry {
+  format: ModelFormat;
+  privacy: ModelPrivacy;
+  costIn?: number;                 // USD per 1M input tokens
+  costOut?: number;                // USD per 1M output tokens
+  bucketUsd?: number;              // quota bucket the model draws from
+  reqPer5h?: number;               // requests per 5 h window
+  jsonStrict?: boolean;            // emits the requested JSON with no prose around it
+  notes?: string;                  // shown as tooltip / badge (Italian, user-visible)
+}
+
+/** Static model facts, measured 2026-09-04 (§11.3); injected into OpenCodeClient and ModelRouter,
+ *  which both stay electron-free. */
+export const MODEL_TABLE: Record<string, ModelTableEntry> = {
+  'minimax-m3': {
+    format: 'chat', privacy: 'zdr', costIn: 0.30, costOut: 1.20, bucketUsd: 60, reqPer5h: 3200, jsonStrict: false,
+    notes: 'ottimo orchestratore (tool call); JSON avvolto in prosa',
+  },
+  'qwen3.7-plus': {
+    format: 'chat', privacy: 'zdr', costIn: 0.40, costOut: 1.60, bucketUsd: 60, reqPer5h: 4300, jsonStrict: true,
+    notes: 'tool call ok',
+  },
+  'qwen3.8-flash': { format: 'chat', privacy: 'zdr', costIn: 0.15, costOut: 0.47, bucketUsd: 30, reqPer5h: 5400 },
+  'deepseek-v4-flash': {
+    format: 'chat', privacy: 'zdr_verify', costIn: 0.22, costOut: 0.66, bucketUsd: 30, reqPer5h: 7600, jsonStrict: true,
+    notes: '1M ctx; ZDR fino al 2026-08-31: conferma rinnovo',
+  },
+  'deepseek-v4-pro': {
+    format: 'chat', privacy: 'zdr_verify', costIn: 0.66, costOut: 1.98, bucketUsd: 15, reqPer5h: 1050,
+    notes: 'escalation worker; stesso avviso ZDR',
+  },
+  'kimi-k2.7-code': {
+    format: 'chat', privacy: 'zdr', costIn: 0.95, costOut: 4.00, bucketUsd: 60, reqPer5h: 1350, jsonStrict: true,
+    notes: 'tool call più efficiente (62 tok)',
+  },
+  'kimi-k3': {
+    format: 'chat', privacy: 'zdr', costIn: 3.00, costOut: 15.00, bucketUsd: 15, reqPer5h: 110,
+    notes: 'quota minima: escluso dai preset',
+  },
+  'glm-5.3-flash': {
+    format: 'chat', privacy: 'zdr', costIn: 0.15, costOut: 0.50, bucketUsd: 15, reqPer5h: 1580, jsonStrict: true,
+    notes: 'probe model',
+  },
+  'glm-5.3': { format: 'chat', privacy: 'zdr', costIn: 1.40, costOut: 4.40, bucketUsd: 15, reqPer5h: 220, notes: 'escalation' },
+  'glm-5.2': { format: 'chat', privacy: 'zdr', costIn: 1.40, costOut: 4.40, bucketUsd: 60, reqPer5h: 880, notes: 'escalation' },
+  hy3: {
+    format: 'chat', privacy: 'zdr', costIn: 0.14, costOut: 0.58, bucketUsd: 60, reqPer5h: 4300, jsonStrict: true,
+    notes: 'reasoning in delta.reasoning',
+  },
+  'longcat-2.0': {
+    format: 'chat', privacy: 'zdr', costIn: 0.30, costOut: 1.20, bucketUsd: 60, reqPer5h: 11400, jsonStrict: true,
+    notes: 'tool call in 71 tok; cache $0.006',
+  },
+  'mimo-v2.5': {
+    format: 'chat', privacy: 'zdr', costIn: 0.14, costOut: 0.28, bucketUsd: 60, reqPer5h: 30100, jsonStrict: true,
+    notes: 'token-hungry: nulla sotto ~700 token di budget → mai come predefinito',
+  },
+  'muse-spark-1.3-contributor': {
+    format: 'responses', privacy: 'training', costIn: 0.10, costOut: 0.20, bucketUsd: 60, reqPer5h: 45300,
+    notes: "403 fino all'opt-in; addestramento dati",
+  },
+  'grok-4.6': {
+    format: 'responses', privacy: 'retention_30d', costIn: 2.00, costOut: 6.00, bucketUsd: 15, reqPer5h: 169,
+    notes: 'escluso dai preset',
+  },
+  'gpt-5.6-luna': {
+    format: 'responses', privacy: 'retention_30d', costIn: 0.20, costOut: 1.20, bucketUsd: 15, reqPer5h: 2050,
+    notes: 'escluso dai preset',
+  },
+};
 
 const MODES: PermissionMode[] = ['strict', 'balanced', 'relaxed'];
 
