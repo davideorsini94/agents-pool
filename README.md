@@ -73,8 +73,17 @@ npm run dist:linux   # AppImage + .deb
 
 I pacchetti finiscono in `release/` (non firmati: imposta `CSC_LINK`/`CSC_KEY_PASSWORD` per firmare).
 Da macOS si producono `.dmg` (arm64 e x64) e l'AppImage Linux per l'architettura dell'host; il `.deb` richiede il download di `fpm`
-e l'installer Windows richiede un host Windows (o `wine`). Il workflow `.github/workflows/build.yml` produce tutti i pacchetti
-sui tre sistemi operativi su GitHub Actions (tag `v*` o avvio manuale).
+e l'installer Windows richiede un host Windows (o `wine`).
+
+Il workflow `.github/workflows/build.yml` produce i pacchetti sui tre sistemi operativi via GitHub Actions. Pusha un tag `vX.Y.Z`
+per farli pubblicare automaticamente come GitHub Release (link permanente, niente scadenza a 90 giorni degli artefatti di Actions):
+
+```bash
+npm version 1.0.1   # aggiorna package.json/package-lock.json e crea il tag v1.0.1
+git push && git push --tags
+```
+
+Un avvio manuale del workflow (senza tag) compila e carica solo gli artefatti della run, senza toccare le Release.
 
 ## Test
 
