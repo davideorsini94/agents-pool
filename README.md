@@ -79,7 +79,7 @@ Il workflow `.github/workflows/build.yml` produce i pacchetti sui tre sistemi op
 per farli pubblicare automaticamente come GitHub Release (link permanente, niente scadenza a 90 giorni degli artefatti di Actions):
 
 ```bash
-npm version 1.0.1   # aggiorna package.json/package-lock.json e crea il tag v1.0.1
+npm version 1.0.3   # aggiorna package.json/package-lock.json e crea il tag v1.0.3
 git push && git push --tags
 ```
 
